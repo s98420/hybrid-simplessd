@@ -38,7 +38,8 @@ namespace PAL {
 
 PALOLD::PALOLD(Parameter &p, ConfigReader &c)
     : AbstractPAL(p, c), lastResetTick(0) {
-  Config::NANDTiming *pTiming = c.getNANDTiming();
+  Config::NANDTiming *pSLCTiming = c.getSLCNANDTiming();
+  Config::NANDTiming *pTLCTiming = c.getTLCNANDTiming();
   Config::NANDPower *pPower = c.getNANDPower();
 
   memset(&stat, 0, sizeof(stat));
@@ -48,27 +49,44 @@ PALOLD::PALOLD(Parameter &p, ConfigReader &c)
 
   // Hybrid mode is fixed to SLC + TLC; MLC timing is not used while the
   // per-plane SLC/TLC block partition is active.
-  latSLC = new LatencySLC(*pTiming, *pPower);
-  latTLC = new LatencyTLC(*pTiming, *pPower);
+  latSLC = new LatencySLC(*pSLCTiming, *pPower);
+  latTLC = new LatencyTLC(*pTLCTiming, *pPower);
   lat = latTLC;
 
-  debugprint(LOG_PAL_OLD, "NAND timing:");
+  debugprint(LOG_PAL_OLD, "SLC NAND timing:");
+  debugprint(LOG_PAL_OLD, "Operation |     CELL   |    DMA 0   |    DMA 1");
+  debugprint(LOG_PAL_OLD,
+             "   READ   | %10" PRIu64 " | %10" PRIu64 " | %10" PRIu64,
+             pSLCTiming->lsb.read, pSLCTiming->dma0.read,
+             pSLCTiming->dma1.read);
+  debugprint(LOG_PAL_OLD,
+             "   WRITE  | %10" PRIu64 " | %10" PRIu64 " | %10" PRIu64,
+             pSLCTiming->lsb.write, pSLCTiming->dma0.write,
+             pSLCTiming->dma1.write);
+  debugprint(LOG_PAL_OLD,
+             "   ERASE  | %10" PRIu64 " | %10" PRIu64 " | %10" PRIu64,
+             pSLCTiming->erase, pSLCTiming->dma0.erase,
+             pSLCTiming->dma1.erase);
+
+  debugprint(LOG_PAL_OLD, "TLC NAND timing:");
   debugprint(LOG_PAL_OLD, "Operation |     LSB    |     CSB    |     MSB    |  "
                           "  DMA 0   |    DMA ");
   debugprint(LOG_PAL_OLD,
              "   READ   | %10" PRIu64 " | %10" PRIu64 " | %10" PRIu64
              " | %10" PRIu64 " | %10" PRIu64,
-             pTiming->lsb.read, pTiming->csb.read, pTiming->msb.read,
-             pTiming->dma0.read, pTiming->dma1.read);
+             pTLCTiming->lsb.read, pTLCTiming->csb.read, pTLCTiming->msb.read,
+             pTLCTiming->dma0.read, pTLCTiming->dma1.read);
   debugprint(LOG_PAL_OLD,
              "   WRITE  | %10" PRIu64 " | %10" PRIu64 " | %10" PRIu64
              " | %10" PRIu64 " | %10" PRIu64,
-             pTiming->lsb.write, pTiming->csb.write, pTiming->msb.write,
-             pTiming->dma0.write, pTiming->dma1.write);
+             pTLCTiming->lsb.write, pTLCTiming->csb.write,
+             pTLCTiming->msb.write, pTLCTiming->dma0.write,
+             pTLCTiming->dma1.write);
   debugprint(LOG_PAL_OLD,
              "   ERASE  |                           %10" PRIu64 " | %10" PRIu64
              " | %10" PRIu64,
-             pTiming->erase, pTiming->dma0.erase, pTiming->dma1.erase);
+             pTLCTiming->erase, pTLCTiming->dma0.erase,
+             pTLCTiming->dma1.erase);
 
   stats = new PALStatistics(&conf, lat);
   pal = new PAL2(stats, &param, &conf, lat);

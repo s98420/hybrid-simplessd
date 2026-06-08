@@ -110,6 +110,8 @@ class Config : public BaseConfig {
   uint8_t PageAllocation[4];    //!< Default: CWDP (0x01, 0x02, 0x04, 0x08)
 
   NANDTiming nandTiming;
+  NANDTiming slcNandTiming;
+  NANDTiming tlcNandTiming;
   NANDPower nandPower;
 
   // Raw variable
@@ -130,6 +132,8 @@ class Config : public BaseConfig {
   uint32_t getPageAllocationConfig();
 
   NANDTiming *getNANDTiming();
+  NANDTiming *getSLCNANDTiming();
+  NANDTiming *getTLCNANDTiming();
   NANDPower *getNANDPower();
 };
 
