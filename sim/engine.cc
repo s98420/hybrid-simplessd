@@ -109,6 +109,7 @@ uint64_t Engine::getCurrentTick() {
 }
 
 SimpleSSD::Event Engine::allocateEvent(SimpleSSD::EventFunction func) {
+  std::lock_guard<std::mutex> guard(mEvent);
   auto iter = eventList.insert({++counter, func});
 
   if (!iter.second) {
@@ -119,6 +120,7 @@ SimpleSSD::Event Engine::allocateEvent(SimpleSSD::EventFunction func) {
 }
 
 void Engine::scheduleEvent(SimpleSSD::Event eid, uint64_t tick) {
+  std::unique_lock<std::mutex> eventGuard(mEvent);
   auto iter = eventList.find(eid);
 
   if (iter != eventList.end()) {
@@ -144,6 +146,8 @@ void Engine::scheduleEvent(SimpleSSD::Event eid, uint64_t tick) {
                       " to %" PRIu64,
                       eid, oldTick, tick);
     }
+    eventGuard.unlock();
+    cvEvent.notify_one();
   }
   else {
     SimpleSSD::panic("Event %" PRIu64 " does not exists", eid);
@@ -151,6 +155,7 @@ void Engine::scheduleEvent(SimpleSSD::Event eid, uint64_t tick) {
 }
 
 void Engine::descheduleEvent(SimpleSSD::Event eid) {
+  std::lock_guard<std::mutex> guard(mEvent);
   auto iter = eventList.find(eid);
 
   if (iter != eventList.end()) {
@@ -162,6 +167,7 @@ void Engine::descheduleEvent(SimpleSSD::Event eid) {
 }
 
 bool Engine::isScheduled(SimpleSSD::Event eid, uint64_t *pTick) {
+  std::lock_guard<std::mutex> guard(mEvent);
   bool ret = false;
   auto iter = eventList.find(eid);
 
@@ -176,6 +182,7 @@ bool Engine::isScheduled(SimpleSSD::Event eid, uint64_t *pTick) {
 }
 
 void Engine::deallocateEvent(SimpleSSD::Event eid) {
+  std::lock_guard<std::mutex> guard(mEvent);
   auto iter = eventList.find(eid);
 
   if (iter != eventList.end()) {
@@ -188,46 +195,59 @@ void Engine::deallocateEvent(SimpleSSD::Event eid) {
 }
 
 bool Engine::doNextEvent() {
+  SimpleSSD::EventFunction callback;
   uint64_t tickCopy;
 
-  if (forceStop) {
-    return false;
-  }
+  {
+    std::lock_guard<std::mutex> eventGuard(mEvent);
 
-  if (eventQueue.size() > 0) {
-    auto &now = eventQueue.front();
-
-    {
-      std::lock_guard<std::mutex> guard(mTick);
-
-      simTick = now.second;
-      tickCopy = simTick;
+    if (forceStop || eventQueue.empty()) {
+      return false;
     }
 
+    auto now = eventQueue.front();
     auto iter = eventList.find(now.first);
 
-    eventQueue.pop_front();
-
-    if (iter != eventList.end()) {
-      iter->second(tickCopy);
-    }
-    else {
+    if (iter == eventList.end()) {
       SimpleSSD::panic("Event %" PRIu64 " does not exists", now.first);
     }
 
-    {
-      std::lock_guard<std::mutex> guard(m);
-      eventHandled++;
-    }
-
-    return true;
+    eventQueue.pop_front();
+    callback = iter->second;
+    tickCopy = now.second;
   }
 
-  return false;
+  {
+    std::lock_guard<std::mutex> guard(mTick);
+    simTick = tickCopy;
+  }
+
+  callback(tickCopy);
+
+  {
+    std::lock_guard<std::mutex> guard(m);
+    eventHandled++;
+  }
+
+  return true;
+}
+
+bool Engine::doNextEventBlocking() {
+  {
+    std::unique_lock<std::mutex> eventGuard(mEvent);
+    cvEvent.wait(eventGuard,
+                 [this]() { return forceStop || !eventQueue.empty(); });
+  }
+
+  return doNextEvent();
 }
 
 void Engine::stopEngine() {
-  forceStop = true;
+  {
+    std::lock_guard<std::mutex> guard(mEvent);
+    forceStop = true;
+  }
+  cvEvent.notify_all();
 }
 
 void Engine::printStats(std::ostream &out) {

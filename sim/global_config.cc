@@ -34,6 +34,7 @@ const char NAME_INTERFACE[] = "Interface";
 const char NAME_SCHEDULER[] = "Scheduler";
 const char NAME_SUBMISSION_LATENCY[] = "SubmissionLatency";
 const char NAME_COMPLETION_LATENCY[] = "CompletionLatency";
+const char NAME_RPC_SOCKET_PATH[] = "RPCSocketPath";
 
 Config::Config() {
   mode = MODE_REQUEST_GENERATOR;
@@ -43,6 +44,7 @@ Config::Config() {
   scheduler = SCHEDULER_NOOP;
   requestLatencyLogEnable = false;
   requestLatencyLogFile = "request_latency.csv";
+  rpcSocketPath = "/tmp/hybrid-simplessd.sock";
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -83,6 +85,9 @@ bool Config::setConfig(const char *name, const char *value) {
   }
   else if (MATCH_NAME(NAME_COMPLETION_LATENCY)) {
     completionLatency = convertTime(value);
+  }
+  else if (MATCH_NAME(NAME_RPC_SOCKET_PATH)) {
+    rpcSocketPath = value;
   }
   else {
     ret = false;
@@ -148,6 +153,9 @@ std::string Config::readString(uint32_t idx) {
       break;
     case GLOBAL_REQUEST_LATENCY_LOG_FILE:
       ret = requestLatencyLogFile;
+      break;
+    case GLOBAL_RPC_SOCKET_PATH:
+      ret = rpcSocketPath;
       break;
   }
 

@@ -50,6 +50,8 @@ static const char *sourceName(BIO_SOURCE source) {
       return "generator";
     case BIO_SOURCE_TRACE:
       return "trace";
+    case BIO_SOURCE_RPC:
+      return "rpc";
     default:
       return "unknown";
   }

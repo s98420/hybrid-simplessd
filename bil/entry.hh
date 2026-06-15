@@ -49,6 +49,7 @@ enum BIO_SOURCE : uint8_t {
   BIO_SOURCE_UNKNOWN,
   BIO_SOURCE_GENERATOR,
   BIO_SOURCE_TRACE,
+  BIO_SOURCE_RPC,
 };
 
 typedef struct _BIO {

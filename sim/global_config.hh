@@ -37,11 +37,13 @@ typedef enum {
   GLOBAL_SCHEDULER,
   GLOBAL_SUBMISSION_LATENCY,
   GLOBAL_COMPLETION_LATENCY,
+  GLOBAL_RPC_SOCKET_PATH,
 } GLOBAL_CONFIG;
 
 typedef enum {
   MODE_REQUEST_GENERATOR,
   MODE_TRACE_REPLAYER,
+  MODE_RPC_SERVER,
   MODE_NUM,
 } SIM_MODE;
 
@@ -72,6 +74,7 @@ class Config : public SimpleSSD::BaseConfig {
   SCHEDULER scheduler;
   uint64_t submissionLatency;
   uint64_t completionLatency;
+  std::string rpcSocketPath;
 
  public:
   Config();

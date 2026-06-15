@@ -23,6 +23,7 @@
 
 #include "bil/entry.hh"
 #include "igl/request/request_generator.hh"
+#include "igl/rpc/rpc_server.hh"
 #include "igl/trace/trace_replayer.hh"
 #include "sil/none/none.hh"
 #include "sil/nvme/nvme.hh"
@@ -225,6 +226,10 @@ int main(int argc, char *argv[]) {
           new IGL::TraceReplayer(engine, *pBIOEntry, endCallback, simConfig);
 
       break;
+    case MODE_RPC_SERVER:
+      pIOGen = new IGL::RPCServer(engine, *pBIOEntry, endCallback, simConfig);
+
+      break;
     default:
       std::cerr << " Undefined simulation mode specified." << std::endl;
 
@@ -276,8 +281,14 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  while (engine.doNextEvent())
-    ;
+  if (simConfig.readUint(CONFIG_GLOBAL, GLOBAL_SIM_MODE) == MODE_RPC_SERVER) {
+    while (engine.doNextEventBlocking())
+      ;
+  }
+  else {
+    while (engine.doNextEvent())
+      ;
+  }
 
   cleanup(0);
 

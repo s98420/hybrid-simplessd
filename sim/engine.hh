@@ -22,6 +22,7 @@
 #ifndef __SIM_ENGINE__
 #define __SIM_ENGINE__
 
+#include <condition_variable>
 #include <iostream>
 #include <list>
 #include <mutex>
@@ -39,6 +40,8 @@ class Engine : public SimpleSSD::Simulator {
   bool forceStop;
   std::unordered_map<SimpleSSD::Event, SimpleSSD::EventFunction> eventList;
   std::list<std::pair<SimpleSSD::Event, uint64_t>> eventQueue;
+  std::mutex mEvent;
+  std::condition_variable cvEvent;
 
   Stopwatch watch;
 
@@ -62,6 +65,7 @@ class Engine : public SimpleSSD::Simulator {
   void deallocateEvent(SimpleSSD::Event) override;
 
   bool doNextEvent();
+  bool doNextEventBlocking();
   void stopEngine();
   void printStats(std::ostream &);
   void getStat(uint64_t &);

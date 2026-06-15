@@ -86,6 +86,9 @@ set(SRC_IGL_TRACE
   igl/trace/trace_config.cc
   igl/trace/trace_replayer.cc
 )
+set(SRC_IGL_RPC
+  igl/rpc/rpc_server.cc
+)
 set(SRC_LIB_DRAMPOWER
   lib/drampower/src/CAHelpers.cc
   lib/drampower/src/CmdHandlers.cc
@@ -128,6 +131,7 @@ set(SRC_UTIL
 SOURCE_GROUP("Source Files\\bil" FILES ${SRC_BIL})
 SOURCE_GROUP("Source Files\\igl\\request" FILES ${SRC_IGL_REQUEST})
 SOURCE_GROUP("Source Files\\igl\\trace" FILES ${SRC_IGL_TRACE})
+SOURCE_GROUP("Source Files\\igl\\rpc" FILES ${SRC_IGL_RPC})
 SOURCE_GROUP("Source Files\\lib\\drampower" FILES ${SRC_LIB_DRAMPOWER})
 SOURCE_GROUP("Source Files\\sil\\none" FILES ${SRC_SIL_NONE})
 SOURCE_GROUP("Source Files\\sil\\nvme" FILES ${SRC_SIL_NVME})
@@ -139,6 +143,7 @@ add_executable(simplessd-standalone
   ${SRC_BIL}
   ${SRC_IGL_REQUEST}
   ${SRC_IGL_TRACE}
+  ${SRC_IGL_RPC}
   ${SRC_LIB_DRAMPOWER}
   ${SRC_SIL_NONE}
   ${SRC_SIL_NVME}
