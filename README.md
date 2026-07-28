@@ -17,9 +17,13 @@ M | LBA | NLB | targetTier
 Q | tier
 
 Read：由 global mapping 自動取得所在 tier。
+
 Write：host 指定 target tier。
+
 Trim：由 global mapping 自動取得所在 tier。
+
 Migration：logical address 不變，只改變 physical tier。
+
 Query：查詢指定 tier 在不觸發 GC 下可立即配置的 page 數量。
 
 3. Cache
