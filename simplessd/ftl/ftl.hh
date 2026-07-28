@@ -32,12 +32,18 @@ class AbstractFTL;
 
 typedef struct {
   uint64_t totalPhysicalBlocks;  //!< (PAL::Parameter::superBlock)
-  uint64_t totalLogicalBlocks;
   uint64_t totalPhysicalBlocksByTier[2];
-  uint64_t totalLogicalBlocksByTier[2];
+  // Per-tier placement limits describe physical-region provisioning only.
+  // They must not be used as host-visible logical address ranges.
+  uint64_t placementLogicalBlocksByTier[2];
+  uint64_t placementLogicalPagesByTier[2];
+  uint64_t globalLogicalBlocks;
+  uint64_t globalLogicalPages;
+  uint64_t globalLogicalUnits;
   uint64_t pagesInBlock;  //!< (PAL::Parameter::page)
   uint32_t pageSize;      //!< Mapping unit (PAL::Parameter::superPageSize)
   uint32_t ioUnitInPage;  //!< # smallest I/O unit in one page
+  uint32_t mappingEntriesPerPage;
   uint32_t pageCountToMaxPerf;  //!< # pages to fully utilize internal parallism
 } Parameter;
 
@@ -55,11 +61,21 @@ class FTL : public StatObject {
   ~FTL();
 
   void read(Request &, uint64_t &);
-  void write(Request &, uint64_t &);
+  bool write(Request &, uint64_t &);
   void trim(Request &, uint64_t &);
   void migrate(MigrationRequest &, uint64_t &);
+  void drainMigrations(MigrationRequest &, uint64_t &);
+  bool migrationDrainRequired() const;
+  std::vector<LCA> getPendingMigrationLCAs() const;
+
+  bool reserveCacheWrite(Tier, uint64_t);
+  bool admitCacheWrite(LCA, Tier, bool, Tier);
+  void releaseCacheWriteReservation(Tier, uint64_t);
+  bool reserveMigration(Tier, uint64_t);
+  void releaseMigrationReservation(Tier, uint64_t);
 
   void format(LPNRange &, uint64_t &);
+  bool getTierSpaceInfo(Tier, TierSpaceInfo &) const;
 
   Parameter *getInfo();
   void getTierLPNInfo(Tier, uint64_t &, uint32_t &);

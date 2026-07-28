@@ -51,6 +51,16 @@ const char NAME_NAND_CSB_WRITE[] = "CSBWrite";
 const char NAME_NAND_MSB_READ[] = "MSBRead";
 const char NAME_NAND_MSB_WRITE[] = "MSBWrite";
 const char NAME_NAND_ERASE[] = "Erase";
+const char NAME_NAND_SLC_READ[] = "SLCRead";
+const char NAME_NAND_SLC_WRITE[] = "SLCWrite";
+const char NAME_NAND_SLC_ERASE[] = "SLCErase";
+const char NAME_NAND_TLC_LSB_READ[] = "TLCLSBRead";
+const char NAME_NAND_TLC_LSB_WRITE[] = "TLCLSBWrite";
+const char NAME_NAND_TLC_CSB_READ[] = "TLCCSBRead";
+const char NAME_NAND_TLC_CSB_WRITE[] = "TLCCSBWrite";
+const char NAME_NAND_TLC_MSB_READ[] = "TLCMSBRead";
+const char NAME_NAND_TLC_MSB_WRITE[] = "TLCMSBWrite";
+const char NAME_NAND_TLC_ERASE[] = "TLCErase";
 
 /* NAND power TODO: seperate this */
 const char NAME_NAND_VOLTAGE[] = "Voltage";
@@ -91,6 +101,8 @@ Config::Config() {
   nandTiming.msb.read = 65000000;     // 65us
   nandTiming.msb.write = 1300000000;  // 1300us
   nandTiming.erase = 3500000000;      // 3.5ms
+  slcNandTiming = nandTiming;
+  tlcNandTiming = nandTiming;
 
   // Set NAND power (From: Micron's MT29F64*)
   nandPower.voltage = 3300;           // 3.3V
@@ -154,24 +166,68 @@ bool Config::setConfig(const char *name, const char *value) {
   }
   else if (MATCH_NAME(NAME_NAND_LSB_READ)) {
     nandTiming.lsb.read = strtoul(value, nullptr, 10);
+    slcNandTiming.lsb.read = nandTiming.lsb.read;
+    tlcNandTiming.lsb.read = nandTiming.lsb.read;
   }
   else if (MATCH_NAME(NAME_NAND_LSB_WRITE)) {
     nandTiming.lsb.write = strtoul(value, nullptr, 10);
+    slcNandTiming.lsb.write = nandTiming.lsb.write;
+    tlcNandTiming.lsb.write = nandTiming.lsb.write;
   }
   else if (MATCH_NAME(NAME_NAND_CSB_READ)) {
     nandTiming.csb.read = strtoul(value, nullptr, 10);
+    slcNandTiming.csb.read = nandTiming.csb.read;
+    tlcNandTiming.csb.read = nandTiming.csb.read;
   }
   else if (MATCH_NAME(NAME_NAND_CSB_WRITE)) {
     nandTiming.csb.write = strtoul(value, nullptr, 10);
+    slcNandTiming.csb.write = nandTiming.csb.write;
+    tlcNandTiming.csb.write = nandTiming.csb.write;
   }
   else if (MATCH_NAME(NAME_NAND_MSB_READ)) {
     nandTiming.msb.read = strtoul(value, nullptr, 10);
+    slcNandTiming.msb.read = nandTiming.msb.read;
+    tlcNandTiming.msb.read = nandTiming.msb.read;
   }
   else if (MATCH_NAME(NAME_NAND_MSB_WRITE)) {
     nandTiming.msb.write = strtoul(value, nullptr, 10);
+    slcNandTiming.msb.write = nandTiming.msb.write;
+    tlcNandTiming.msb.write = nandTiming.msb.write;
   }
   else if (MATCH_NAME(NAME_NAND_ERASE)) {
     nandTiming.erase = strtoul(value, nullptr, 10);
+    slcNandTiming.erase = nandTiming.erase;
+    tlcNandTiming.erase = nandTiming.erase;
+  }
+  else if (MATCH_NAME(NAME_NAND_SLC_READ)) {
+    slcNandTiming.lsb.read = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_SLC_WRITE)) {
+    slcNandTiming.lsb.write = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_SLC_ERASE)) {
+    slcNandTiming.erase = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_LSB_READ)) {
+    tlcNandTiming.lsb.read = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_LSB_WRITE)) {
+    tlcNandTiming.lsb.write = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_CSB_READ)) {
+    tlcNandTiming.csb.read = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_CSB_WRITE)) {
+    tlcNandTiming.csb.write = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_MSB_READ)) {
+    tlcNandTiming.msb.read = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_MSB_WRITE)) {
+    tlcNandTiming.msb.write = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_NAND_TLC_ERASE)) {
+    tlcNandTiming.erase = strtoul(value, nullptr, 10);
   }
   else if (MATCH_NAME(NAME_NAND_VOLTAGE)) {
     nandPower.voltage = strtoul(value, nullptr, 10);
@@ -217,6 +273,10 @@ void Config::update() {
   nandTiming.dma1.read = pageSize * tCK / (dmaWidth / 8);
   nandTiming.dma1.write = 1 * tCK / (dmaWidth / 8);
   nandTiming.dma1.erase = 1 * tCK / (dmaWidth / 8);
+  slcNandTiming.dma0 = nandTiming.dma0;
+  slcNandTiming.dma1 = nandTiming.dma1;
+  tlcNandTiming.dma0 = nandTiming.dma0;
+  tlcNandTiming.dma1 = nandTiming.dma1;
 
   // Parse page allocation setting
   int i = 0;
@@ -387,7 +447,16 @@ uint32_t Config::getPageAllocationConfig() {
 }
 
 Config::NANDTiming *Config::getNANDTiming() {
-  return &nandTiming;
+  // Legacy single-timing users expose the main TLC region in hybrid mode.
+  return &tlcNandTiming;
+}
+
+Config::NANDTiming *Config::getSLCNANDTiming() {
+  return &slcNandTiming;
+}
+
+Config::NANDTiming *Config::getTLCNANDTiming() {
+  return &tlcNandTiming;
 }
 
 Config::NANDPower *Config::getNANDPower() {

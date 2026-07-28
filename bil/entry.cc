@@ -39,6 +39,8 @@ static const char *typeName(BIO_TYPE type) {
       return "TRIM";
     case BIO_MIGRATE:
       return "MIGRATE";
+    case BIO_QUERY:
+      return "QUERY";
     default:
       return "UNKNOWN";
   }
@@ -87,7 +89,7 @@ BlockIOEntry::BlockIOEntry(ConfigReader &c, Engine &e, DriverInterface *i,
 
   if (pRequestLatencyFile) {
     *pRequestLatencyFile
-        << "id,source,op,tier,src_tier,dst_tier,lba,src_lba,dst_lba,nlb,"
+        << "id,source,op,tier,lba,nlb,"
            "offset,length,submit_tick,complete_tick,latency_tick,status"
         << std::endl;
   }
@@ -169,26 +171,9 @@ void BlockIOEntry::writeRequestLatency(BIO &bio, uint64_t completeTick,
   }
 
   *pRequestLatencyFile << bio.id << "," << sourceName(bio.source) << ","
-                       << typeName(bio.type) << ",";
-
-  if (bio.type == BIO_MIGRATE) {
-    *pRequestLatencyFile << ",";
-  }
-  else {
-    *pRequestLatencyFile << (uint32_t)bio.tier << ",";
-  }
-
-  if (bio.type == BIO_MIGRATE) {
-    *pRequestLatencyFile << (uint32_t)bio.srcTier << ","
-                         << (uint32_t)bio.dstTier << ",,"
-                         << bio.srcLBA << "," << bio.dstLBA << ","
-                         << bio.nlb << ",";
-  }
-  else {
-    *pRequestLatencyFile << ",,";
-    *pRequestLatencyFile << lba << ",,,"
-                         << (bio.nlb > 0 ? bio.nlb : bio.length / 512) << ",";
-  }
+                       << typeName(bio.type) << "," << (uint32_t)bio.tier
+                       << "," << lba << ","
+                       << (bio.nlb > 0 ? bio.nlb : bio.length / 512) << ",";
 
   *pRequestLatencyFile << bio.offset << "," << bio.length << ","
                        << bio.submittedAt << "," << completeTick << ","

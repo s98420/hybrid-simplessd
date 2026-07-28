@@ -144,7 +144,8 @@ class Namespace {
   Information *getInfo();
   bool isAttached();
 
-  void format(uint64_t);
+  void beginFormat();
+  void finishFormat(uint64_t);
 };
 
 }  // namespace NVMe

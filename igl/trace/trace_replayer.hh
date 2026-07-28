@@ -27,6 +27,7 @@
 #include <mutex>
 #include <regex>
 #include <thread>
+#include <unordered_map>
 
 #include "bil/entry.hh"
 #include "igl/io_gen.hh"
@@ -44,11 +45,6 @@ class TraceReplayer : public IOGenerator {
     ID_LBA_OFFSET,
     ID_LBA_LENGTH,
     ID_TIER,
-    ID_MIGRATION_SRC_TIER,
-    ID_MIGRATION_SRC_LBA,
-    ID_MIGRATION_DST_TIER,
-    ID_MIGRATION_DST_LBA,
-    ID_MIGRATION_NLB,
     ID_TIME_SEC,
     ID_TIME_MS,
     ID_TIME_US,
@@ -92,12 +88,17 @@ class TraceReplayer : public IOGenerator {
   uint64_t io_count;      // I/O count created and submitted
   uint64_t read_count;
   uint64_t write_count;
+  uint64_t query_count;
 
   uint64_t io_depth;
+  std::unordered_map<
+      uint64_t, std::shared_ptr<SimpleSSD::TierSpaceInfo>> queryResults;
 
   uint64_t mergeTime(std::smatch &);
   BIL::BIO_TYPE getType(std::string);
   uint8_t getTier(std::string);
+  uint8_t getQueryTier(std::string);
+  bool parseSimpleQueryLine(const std::string &);
   bool parseSimpleLine(const std::string &);
   void parseLine();
   void rescheduleSubmit(uint64_t);
@@ -106,25 +107,17 @@ class TraceReplayer : public IOGenerator {
     uint64_t tick;
     uint64_t offset;
     uint64_t length;
-    uint64_t srcLBA;
-    uint64_t dstLBA;
     uint64_t nlb;
     BIL::BIO_TYPE type;
     uint8_t tier;
-    uint8_t srcTier;
-    uint8_t dstTier;
 
     TraceLine()
         : tick(0),
           offset(0),
           length(0),
-          srcLBA(0),
-          dstLBA(0),
           nlb(0),
           type(BIL::BIO_NUM),
-          tier(1),
-          srcTier(1),
-          dstTier(1) {}
+          tier(1) {}
   } linedata;
 
   SimpleSSD::Event submitEvent;

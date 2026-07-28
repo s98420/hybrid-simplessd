@@ -20,8 +20,11 @@
 #include "ftl/page_mapping.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <numeric>
 #include <random>
+#include <unordered_set>
 
 #include "util/algorithm.hh"
 #include "util/bitset.hh"
@@ -36,8 +39,8 @@ PageMapping::RegionState::_RegionState(uint32_t pageCountToMaxPerf,
       blockBegin(0),
       blockEnd(0),
       totalPhysicalBlocks(0),
-      totalLogicalBlocks(0),
-      totalLogicalPages(0),
+      placementLogicalBlocks(0),
+      placementLogicalPages(0),
       nFreeBlocks(0),
       lastFreeBlock(pageCountToMaxPerf),
       lastFreeBlockIOMap(ioUnitInPage),
@@ -55,9 +58,19 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
       pPAL(l),
       conf(c),
       regions{RegionState(param.pageCountToMaxPerf, param.ioUnitInPage),
-              RegionState(param.pageCountToMaxPerf, param.ioUnitInPage)} {
+              RegionState(param.pageCountToMaxPerf, param.ioUnitInPage)},
+      pendingCacheWriteUnitsByTier{0, 0},
+      pendingMigrationUnitsByTier{0, 0},
+      migrationListLimit(
+          conf.readUint(CONFIG_FTL, FTL_MIGRATION_LIST_LIMIT)),
+      migrationStat{} {
   bRandomTweak = conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK);
-  bitsetSize = bRandomTweak ? param.ioUnitInPage : 1;
+  bitsetSize = param.mappingEntriesPerPage;
+  table.reserve(param.globalLogicalPages);
+
+  if (migrationListLimit == 0) {
+    panic("ftl: MigrationListLimit must be greater than zero");
+  }
 
   uint32_t begin = 0;
 
@@ -68,12 +81,11 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
     region.blockBegin = begin;
     region.blockEnd = begin + param.totalPhysicalBlocksByTier[rid];
     region.totalPhysicalBlocks = param.totalPhysicalBlocksByTier[rid];
-    region.totalLogicalBlocks = param.totalLogicalBlocksByTier[rid];
-    region.totalLogicalPages = region.totalLogicalBlocks * param.pagesInBlock;
-    region.status.totalLogicalPages = region.totalLogicalPages;
+    region.placementLogicalBlocks = param.placementLogicalBlocksByTier[rid];
+    region.placementLogicalPages = param.placementLogicalPagesByTier[rid];
+    region.status.totalLogicalPages = region.placementLogicalPages;
 
     region.blocks.reserve(region.totalPhysicalBlocks);
-    region.table.reserve(region.totalLogicalPages);
 
     for (uint32_t i = region.blockBegin; i < region.blockEnd; i++) {
       region.freeBlocks.emplace_back(
@@ -83,7 +95,13 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
     region.nFreeBlocks = region.totalPhysicalBlocks;
 
     for (uint32_t i = 0; i < param.pageCountToMaxPerf; i++) {
-      region.lastFreeBlock.at(i) = getFreeBlock(region, i);
+      uint32_t blockIndex;
+
+      if (!getFreeBlock(region, i, blockIndex)) {
+        panic("ftl: insufficient free blocks for initial write frontiers");
+      }
+
+      region.lastFreeBlock.at(i) = blockIndex;
     }
 
     begin = region.blockEnd;
@@ -96,15 +114,30 @@ bool PageMapping::initialize() {
   uint64_t tick;
   uint64_t valid;
   uint64_t invalid;
-  FILLING_MODE mode;
-
+  FILLING_MODE mode = (FILLING_MODE)conf.readUint(CONFIG_FTL, FTL_FILLING_MODE);
   Request req(param.ioUnitInPage);
+  std::vector<LPN> globalLpnPool(param.globalLogicalPages);
+  std::array<std::vector<LPN>, 2> mappedLpnsByTier;
+  std::unordered_set<LPN> initializedLpns;
+  std::random_device rd;
+  std::mt19937_64 gen(rd());
+  uint64_t nextGlobalLpn = 0;
 
   debugprint(LOG_FTL_PAGE_MAPPING, "Initialization started");
 
-  mode = (FILLING_MODE)conf.readUint(CONFIG_FTL, FTL_FILLING_MODE);
+  if (mode != FILLING_MODE_0 && mode != FILLING_MODE_1 &&
+      mode != FILLING_MODE_2) {
+    panic("ftl: invalid filling mode");
+  }
 
-  for (auto &region : regions) {
+  std::iota(globalLpnPool.begin(), globalLpnPool.end(), static_cast<LPN>(0));
+
+  if (mode == FILLING_MODE_2) {
+    std::shuffle(globalLpnPool.begin(), globalLpnPool.end(), gen);
+  }
+
+  for (uint32_t rid = 0; rid < regions.size(); rid++) {
+    auto &region = regions[rid];
     const char *tierName = region.tier == Tier::SLC ? "SLC" : "TLC";
     float fillRatio =
         conf.readFloat(CONFIG_FTL, region.tier == Tier::SLC
@@ -114,7 +147,7 @@ bool PageMapping::initialize() {
         conf.readFloat(CONFIG_FTL, region.tier == Tier::SLC
                                        ? FTL_SLC_INVALID_PAGE_RATIO
                                        : FTL_TLC_INVALID_PAGE_RATIO);
-    uint64_t nTotalLogicalPages = region.totalLogicalPages;
+    uint64_t nTotalLogicalPages = region.placementLogicalPages;
     uint64_t nPagesToWarmup = nTotalLogicalPages * fillRatio;
     uint64_t nPagesToInvalidate = nTotalLogicalPages * invalidRatio;
     uint64_t maxPagesBeforeGC =
@@ -148,58 +181,47 @@ bool PageMapping::initialize() {
     req.tier = region.tier;
     req.ioFlag.set();
 
-    // Step 1. Filling
-    if (mode == FILLING_MODE_0 || mode == FILLING_MODE_1) {
-      // Sequential
-      for (uint64_t i = 0; i < nPagesToWarmup; i++) {
-        tick = 0;
-        req.lpn = i;
-        writeInternal(req, region, tick, false);
-      }
-    }
-    else {
-      // Random
-      std::random_device rd;
-      std::mt19937_64 gen(rd());
-      std::uniform_int_distribution<uint64_t> dist(0, nTotalLogicalPages - 1);
-
-      for (uint64_t i = 0; i < nPagesToWarmup; i++) {
-        tick = 0;
-        req.lpn = dist(gen);
-        writeInternal(req, region, tick, false);
-      }
+    if (!isValidLogicalRange(nextGlobalLpn, nPagesToWarmup,
+                             globalLpnPool.size())) {
+      panic("ftl: tier warm-up exceeds the global logical LPN pool");
     }
 
-    // Step 2. Invalidating
-    if (mode == FILLING_MODE_0) {
-      // Sequential
-      for (uint64_t i = 0; i < nPagesToInvalidate; i++) {
-        tick = 0;
-        req.lpn = i;
-        writeInternal(req, region, tick, false);
+    // Step 1. Filling. Logical selection is global and unique; tier placement
+    // remains an independent choice made by the enclosing region loop.
+    for (uint64_t i = 0; i < nPagesToWarmup; i++) {
+      tick = 0;
+      req.lpn = globalLpnPool.at(nextGlobalLpn++);
+
+      if (!initializedLpns.insert(req.lpn).second) {
+        panic("ftl: duplicate global LPN selected during warm-up");
       }
+
+      if (!writeInternal(req, region, tick, false)) {
+        panic("ftl: warm-up allocation unexpectedly failed");
+      }
+      mappedLpnsByTier[rid].push_back(req.lpn);
     }
-    else if (mode == FILLING_MODE_1) {
-      std::random_device rd;
-      std::mt19937_64 gen(rd());
-      std::uniform_int_distribution<uint64_t> dist(0, nPagesToWarmup - 1);
+
+    if (mappedLpnsByTier[rid].empty() && nPagesToInvalidate > 0) {
+      warn("ftl: cannot create invalid pages without mapped global LPNs");
+      nPagesToInvalidate = 0;
+    }
+
+    // Step 2. Invalidating by overwriting only globally mapped LPNs in the
+    // selected physical tier.
+    if (nPagesToInvalidate > 0) {
+      std::uniform_int_distribution<uint64_t> dist(
+          0, mappedLpnsByTier[rid].size() - 1);
 
       for (uint64_t i = 0; i < nPagesToInvalidate; i++) {
         tick = 0;
-        req.lpn = dist(gen);
-        writeInternal(req, region, tick, false);
-      }
-    }
-    else {
-      // Random
-      std::random_device rd;
-      std::mt19937_64 gen(rd());
-      std::uniform_int_distribution<uint64_t> dist(0, nTotalLogicalPages - 1);
-
-      for (uint64_t i = 0; i < nPagesToInvalidate; i++) {
-        tick = 0;
-        req.lpn = dist(gen);
-        writeInternal(req, region, tick, false);
+        uint64_t selected =
+            mode == FILLING_MODE_0 ? i % mappedLpnsByTier[rid].size()
+                                   : dist(gen);
+        req.lpn = mappedLpnsByTier[rid].at(selected);
+        if (!writeInternal(req, region, tick, false)) {
+          panic("ftl: warm-up overwrite allocation unexpectedly failed");
+        }
       }
     }
 
@@ -219,6 +241,14 @@ bool PageMapping::initialize() {
                nPagesToInvalidate, (int64_t)(invalid - nPagesToInvalidate));
   }
 
+  if (initializedLpns.size() != nextGlobalLpn) {
+    panic("ftl: global warm-up LPN accounting is inconsistent");
+  }
+
+  debugprint(LOG_FTL_PAGE_MAPPING,
+             "Global unique initialized logical pages: %" PRIu64,
+             static_cast<uint64_t>(initializedLpns.size()));
+
   debugprint(LOG_FTL_PAGE_MAPPING, "Initialization finished");
 
   return true;
@@ -226,14 +256,13 @@ bool PageMapping::initialize() {
 
 void PageMapping::read(Request &req, uint64_t &tick) {
   uint64_t begin = tick;
-  auto &region = getRegion(req.tier);
 
-  if (req.lpn >= region.totalLogicalPages) {
-    panic("ftl: read LPN out of selected tier range");
+  if (req.lpn >= param.globalLogicalPages) {
+    panic("ftl: read LPN out of global logical range");
   }
 
   if (req.ioFlag.count() > 0) {
-    readInternal(req, region, tick);
+    readInternal(req, tick);
 
     debugprint(LOG_FTL_PAGE_MAPPING,
                "READ  | LPN %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64
@@ -247,16 +276,60 @@ void PageMapping::read(Request &req, uint64_t &tick) {
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::READ);
 }
 
-void PageMapping::write(Request &req, uint64_t &tick) {
+bool PageMapping::write(Request &req, uint64_t &tick) {
   uint64_t begin = tick;
+
+  if (!isValidTier(req.tier)) {
+    panic("ftl: write target tier is invalid");
+  }
+
   auto &region = getRegion(req.tier);
 
-  if (req.lpn >= region.totalLogicalPages) {
-    panic("ftl: write LPN out of selected tier range");
+  if (req.lpn >= param.globalLogicalPages) {
+    panic("ftl: write LPN out of global logical range");
   }
 
   if (req.ioFlag.count() > 0) {
-    writeInternal(req, region, tick);
+    uint64_t units = req.ioFlag.count();
+    std::array<uint64_t, 2> migrationReleases{0, 0};
+    std::vector<LCA> migrationsToCancel;
+
+    if (req.supersedesPendingMigration) {
+      for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+        if (!req.ioFlag.test(idx)) {
+          continue;
+        }
+
+        LCA lca = lpnToLca(req.lpn, idx, bitsetSize);
+        auto pending = pendingMigrations.find(lca);
+
+        if (pending != pendingMigrations.end()) {
+          migrationReleases.at(tierIndex(pending->second.targetTier))++;
+          migrationsToCancel.push_back(lca);
+        }
+      }
+    }
+
+    if (!canAllocateAfterMigrationCancellation(
+            region, units, req.reservationOwner, migrationReleases, false)) {
+      warn("ftl: write rejected by target-tier reservation admission");
+      tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE);
+
+      return false;
+    }
+
+    if (!writeInternal(req, region, tick)) {
+      warn("ftl: write rejected because target tier has no writable page");
+      tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE);
+
+      return false;
+    }
+
+    for (LCA lca : migrationsToCancel) {
+      cancelPendingMigration(lca, CancellationReason::Write);
+    }
+
+    consumeReservation(req.tier, units, req.reservationOwner);
 
     debugprint(LOG_FTL_PAGE_MAPPING,
                "WRITE | LPN %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64
@@ -268,17 +341,25 @@ void PageMapping::write(Request &req, uint64_t &tick) {
   }
 
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE);
+
+  return true;
 }
 
 void PageMapping::trim(Request &req, uint64_t &tick) {
   uint64_t begin = tick;
-  auto &region = getRegion(req.tier);
 
-  if (req.lpn >= region.totalLogicalPages) {
-    panic("ftl: trim LPN out of selected tier range");
+  if (req.lpn >= param.globalLogicalPages) {
+    panic("ftl: trim LPN out of global logical range");
   }
 
-  trimInternal(req, region, tick);
+  for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+    if (req.ioFlag.test(idx)) {
+      cancelPendingMigration(lpnToLca(req.lpn, idx, bitsetSize),
+                             CancellationReason::Trim);
+    }
+  }
+
+  trimInternal(req, tick);
 
   debugprint(LOG_FTL_PAGE_MAPPING,
              "TRIM  | LPN %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64
@@ -288,218 +369,453 @@ void PageMapping::trim(Request &req, uint64_t &tick) {
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::TRIM);
 }
 
-bool PageMapping::migrate(MigrationRequest &req, uint64_t &tick) {
-  RegionState &srcRegion = getRegion(req.srcTier);
-  RegionState &dstRegion = getRegion(req.dstTier);
-  uint64_t beginAt;
-  uint64_t finishedAt = tick;
+void PageMapping::migrate(MigrationRequest &req, uint64_t &tick) {
+  req.status = enqueueMigration(req, tick);
+}
 
-  if (req.srcTier == req.dstTier) {
-    warn("ftl: migration source and destination tier are identical");
-    return false;
+void PageMapping::drainMigrations(MigrationRequest &req, uint64_t &tick) {
+  if (req.status == MigrationStatus::Success && migrationDrainRequired()) {
+    req.status = drainPendingMigrations(tick);
+  }
+}
+
+bool PageMapping::migrationDrainRequired() const {
+  return pendingMigrations.size() >= migrationListLimit;
+}
+
+std::vector<LCA> PageMapping::getPendingMigrationLCAs() const {
+  return std::vector<LCA>(pendingMigrationOrder.begin(),
+                          pendingMigrationOrder.end());
+}
+
+MigrationStatus PageMapping::enqueueMigration(MigrationRequest &request,
+                                              uint64_t tick) {
+  enum class Action : uint8_t {
+    None = 0,
+    Add,
+    Update,
+    RemoveSatisfied,
+  };
+
+  typedef struct _PlannedUpdate {
+    LCA lca;
+    Action action;
+  } PlannedUpdate;
+
+  if (!isValidTier(request.targetTier)) {
+    return MigrationStatus::InvalidTier;
   }
 
-  if (req.nlp == 0) {
-    warn("ftl: migration requested zero logical pages");
-    return false;
+  if (request.count == 0 ||
+      !isValidLogicalRange(request.startLCA, request.count,
+                           param.globalLogicalUnits)) {
+    return MigrationStatus::OutOfRange;
   }
 
-  for (uint64_t i = 0; i < req.nlp; i++) {
-    uint64_t srcLCA = req.srcLPN + i;
-    uint64_t dstLCA = req.dstLPN + i;
+  std::vector<PlannedUpdate> updates;
+  std::array<uint64_t, 2> cacheReleases{0, 0};
+  std::array<uint64_t, 2> cacheAdds{0, 0};
+  std::array<uint64_t, 2> migrationReleases{0, 0};
+  std::array<uint64_t, 2> migrationAdds{0, 0};
+  std::array<uint64_t, 2> finalCache{0, 0};
+  std::array<uint64_t, 2> finalMigration{0, 0};
 
-    if (srcLCA >= srcRegion.totalLogicalPages * bitsetSize ||
-        dstLCA >= dstRegion.totalLogicalPages * bitsetSize) {
-      warn("ftl: migration LPN out of selected tier range");
-      return false;
+  updates.reserve(request.count);
+
+  for (uint64_t offset = 0; offset < request.count; offset++) {
+    LCA lca = request.startLCA + offset;
+    LPN lpn = lcaToLpn(lca, bitsetSize);
+    uint32_t mappingIndex = lcaToMappingIndex(lca, bitsetSize);
+    auto mappingList = table.find(lpn);
+
+    if (mappingList == table.end() ||
+        !checkMappingAddress(
+            mappingList->second.at(mappingIndex),
+            "ftl: migration source mapping is inconsistent")) {
+      return MigrationStatus::UnmappedSource;
     }
 
-    if (!isValidMapping(srcRegion, srcLCA / bitsetSize,
-                        srcLCA % bitsetSize)) {
-      warn("ftl: migration source is invalid");
-      return false;
-    }
+    const MappingEntry &mapping = mappingList->second.at(mappingIndex);
+    auto pending = pendingMigrations.find(lca);
+    Action action = Action::None;
 
-    if (isValidMapping(dstRegion, dstLCA / bitsetSize, dstLCA % bitsetSize)) {
-      warn("ftl: migration destination is already valid");
-      return false;
-    }
-  }
-
-  for (uint64_t i = 0; i < req.nlp; i++) {
-    uint64_t srcLCA = req.srcLPN + i;
-    uint64_t dstLCA = req.dstLPN + i;
-    uint64_t srcLPN = srcLCA / bitsetSize;
-    uint64_t dstLPN = dstLCA / bitsetSize;
-    uint32_t srcIdx = srcLCA % bitsetSize;
-    uint32_t dstIdx = dstLCA % bitsetSize;
-    Bitset iomap(param.ioUnitInPage);
-
-    auto srcMappingList = srcRegion.table.find(srcLPN);
-    auto dstMappingList = dstRegion.table.find(dstLPN);
-
-    if (srcMappingList == srcRegion.table.end()) {
-      panic("ftl: migration source mapping disappeared");
-    }
-
-    if (dstMappingList == dstRegion.table.end()) {
-      auto ret = dstRegion.table.emplace(
-          dstLPN,
-          std::vector<std::pair<uint32_t, uint32_t>>(
-              bitsetSize, {param.totalPhysicalBlocks, param.pagesInBlock}));
-
-      if (!ret.second) {
-        panic("ftl: failed to insert migration destination mapping");
+    if (mapping.tier == request.targetTier) {
+      if (pending != pendingMigrations.end()) {
+        migrationReleases.at(tierIndex(pending->second.targetTier))++;
+        action = Action::RemoveSatisfied;
       }
-
-      dstMappingList = ret.first;
+    }
+    else if (pending == pendingMigrations.end()) {
+      migrationAdds.at(tierIndex(request.targetTier))++;
+      action = Action::Add;
+    }
+    else if (pending->second.targetTier != request.targetTier) {
+      migrationReleases.at(tierIndex(pending->second.targetTier))++;
+      migrationAdds.at(tierIndex(request.targetTier))++;
+      action = Action::Update;
     }
 
-    auto &srcMapping = srcMappingList->second.at(srcIdx);
-    auto &dstMapping = dstMappingList->second.at(dstIdx);
+    updates.push_back({lca, action});
+  }
 
-    if (!checkMappingAddress(srcRegion, srcMapping,
-                             "ftl: migration source mapping is invalid")) {
-      panic("ftl: migration source mapping disappeared");
-    }
+  if (!calculateFinalReservations(
+          cacheReleases, cacheAdds, migrationReleases, migrationAdds,
+          finalCache, finalMigration)) {
+    return MigrationStatus::NoSpace;
+  }
 
-    if (checkMappingAddress(dstRegion, dstMapping,
-                            "ftl: migration destination mapping is invalid")) {
-      panic("ftl: migration destination became valid");
-    }
+  for (const auto &update : updates) {
+    auto pending = pendingMigrations.find(update.lca);
 
-    auto srcBlock = srcRegion.blocks.find(srcMapping.first);
+    switch (update.action) {
+      case Action::None:
+        break;
+      case Action::Add: {
+        pendingMigrationOrder.push_back(update.lca);
+        auto orderIterator = pendingMigrationOrder.end();
+        --orderIterator;
+        auto inserted = pendingMigrations.emplace(
+            update.lca,
+            PendingMigration(request.targetTier, tick, orderIterator));
 
-    if (srcBlock == srcRegion.blocks.end()) {
-      panic("ftl: migration source block is not in use");
-    }
-
-    iomap.set(dstIdx);
-
-    auto dstBlock = dstRegion.blocks.find(getLastFreeBlock(dstRegion, iomap));
-
-    if (dstBlock == dstRegion.blocks.end() ||
-        !isInRegion(dstRegion, dstBlock->first)) {
-      panic("ftl: migration destination block is outside selected region");
-    }
-
-    uint32_t dstPageIndex = dstBlock->second.getNextWritePageIndex(dstIdx);
-    PAL::Request palReq(param.ioUnitInPage);
-
-    beginAt = tick;
-
-    srcBlock->second.read(srcMapping.second, srcIdx, beginAt);
-    palReq.tier = req.srcTier;
-    palReq.blockIndex = srcMapping.first;
-    palReq.pageIndex = srcMapping.second;
-    palReq.ioFlag.reset();
-    palReq.ioFlag.set(srcIdx);
-    pPAL->read(palReq, beginAt);
-
-    dstBlock->second.write(dstPageIndex, dstLPN, dstIdx, beginAt);
-    palReq.tier = req.dstTier;
-    palReq.blockIndex = dstBlock->first;
-    palReq.pageIndex = dstPageIndex;
-    palReq.ioFlag.reset();
-    palReq.ioFlag.set(dstIdx);
-    pPAL->write(palReq, beginAt);
-
-    srcBlock->second.invalidate(srcMapping.second, srcIdx);
-    srcMapping = {param.totalPhysicalBlocks, param.pagesInBlock};
-    dstMapping = {dstBlock->first, dstPageIndex};
-
-    bool sourceEmpty = true;
-
-    for (auto &mapping : srcMappingList->second) {
-      if (checkMappingAddress(srcRegion, mapping,
-                              "ftl: migration source mapping is invalid")) {
-        sourceEmpty = false;
+        if (!inserted.second) {
+          panic("ftl: duplicate pending migration during atomic commit");
+        }
 
         break;
       }
-    }
+      case Action::Update:
+        if (pending == pendingMigrations.end()) {
+          panic("ftl: pending migration disappeared during atomic update");
+        }
 
-    if (sourceEmpty) {
-      srcRegion.table.erase(srcMappingList);
-    }
+        pending->second.targetTier = request.targetTier;
+        break;
+      case Action::RemoveSatisfied:
+        if (pending == pendingMigrations.end()) {
+          panic("ftl: satisfied pending migration disappeared during commit");
+        }
 
-    finishedAt = MAX(finishedAt, beginAt);
+        removePendingMigration(pending, false);
+        break;
+    }
   }
 
-  tick = finishedAt;
+  pendingCacheWriteUnitsByTier = finalCache;
+  pendingMigrationUnitsByTier = finalMigration;
+  migrationStat.maximumQueueEntries =
+      MAX(migrationStat.maximumQueueEntries,
+          static_cast<uint64_t>(pendingMigrations.size()));
+
+  return MigrationStatus::Success;
+}
+
+MigrationStatus PageMapping::executePendingMigration(
+    LCA lca, MigrationTrigger trigger, uint64_t &tick,
+    const MappingEntry *expectedSource, bool sourceDataReady) {
+  if (sourceDataReady && expectedSource == nullptr) {
+    return MigrationStatus::InternalError;
+  }
+
+  auto pending = pendingMigrations.find(lca);
+
+  if (pending == pendingMigrations.end()) {
+    return MigrationStatus::InternalError;
+  }
+
+  LPN lpn = lcaToLpn(lca, bitsetSize);
+  uint32_t mappingIndex = lcaToMappingIndex(lca, bitsetSize);
+  auto mappingList = table.find(lpn);
+
+  if (mappingList == table.end()) {
+    return MigrationStatus::InternalError;
+  }
+
+  MappingEntry &mapping = mappingList->second.at(mappingIndex);
+
+  if (!checkMappingAddress(
+          mapping, "ftl: pending migration source mapping is inconsistent")) {
+    return MigrationStatus::InternalError;
+  }
+
+  if (expectedSource != nullptr &&
+      (!expectedSource->valid || mapping.tier != expectedSource->tier ||
+       mapping.block != expectedSource->block ||
+       mapping.page != expectedSource->page)) {
+    return MigrationStatus::InternalError;
+  }
+
+  Tier targetTier = pending->second.targetTier;
+
+  if (mapping.tier == targetTier) {
+    removePendingMigration(pending, true);
+
+    return MigrationStatus::Success;
+  }
+
+  Bitset migrationIOMap(param.ioUnitInPage);
+
+  if (bRandomTweak) {
+    migrationIOMap.set(mappingIndex);
+  }
+  else {
+    migrationIOMap.set();
+  }
+
+  auto &sourceRegion = getRegion(mapping.tier);
+  auto sourceBlock = sourceRegion.blocks.find(mapping.block);
+
+  if (sourceBlock == sourceRegion.blocks.end() ||
+      !sourceBlock->second.read(mapping.page, mappingIndex, tick)) {
+    return MigrationStatus::InternalError;
+  }
+
+  if (!sourceDataReady) {
+    PAL::Request readRequest(param.ioUnitInPage);
+    readRequest.tier = mapping.tier;
+    readRequest.blockIndex = mapping.block;
+    readRequest.pageIndex = mapping.page;
+    readRequest.ioFlag = migrationIOMap;
+    pPAL->read(readRequest, tick);
+  }
+
+  auto &targetRegion = getRegion(targetTier);
+
+  if (!canAllocate(targetRegion, 1, ReservationOwner::Migration, true)) {
+    return MigrationStatus::InternalError;
+  }
+
+  uint32_t targetBlockIndex;
+
+  if (!getLastFreeBlock(targetRegion, migrationIOMap,
+                        targetBlockIndex)) {
+    return MigrationStatus::InternalError;
+  }
+
+  auto targetBlock = targetRegion.blocks.find(targetBlockIndex);
+
+  if (targetBlock == targetRegion.blocks.end() ||
+      !isInRegion(targetRegion, targetBlockIndex)) {
+    return MigrationStatus::InternalError;
+  }
+
+  uint32_t targetPage =
+      targetBlock->second.getNextWritePageIndex(mappingIndex);
+
+  if (!targetBlock->second.write(targetPage, lpn, mappingIndex, tick)) {
+    panic("ftl: reserved migration target is not writable");
+  }
+
+  PAL::Request writeRequest(param.ioUnitInPage);
+  writeRequest.tier = targetTier;
+  writeRequest.blockIndex = targetBlockIndex;
+  writeRequest.pageIndex = targetPage;
+  writeRequest.ioFlag = migrationIOMap;
+  pPAL->write(writeRequest, tick);
+
+  if (expectedSource != nullptr &&
+      (mapping.tier != expectedSource->tier ||
+       mapping.block != expectedSource->block ||
+       mapping.page != expectedSource->page)) {
+    panic("ftl: pending migration source changed before mapping commit");
+  }
+
+  commitMappingReplacement(
+      mapping, MappingEntry(targetTier, targetBlockIndex, targetPage),
+      mappingIndex);
+  removePendingMigration(pending, true);
+
+  switch (trigger) {
+    case MigrationTrigger::GarbageCollection:
+      migrationStat.executedByGarbageCollection++;
+      break;
+    case MigrationTrigger::ListFull:
+      migrationStat.executedByListFull++;
+      break;
+  }
+
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE_INTERNAL);
 
-  return true;
+  return MigrationStatus::Success;
+}
+
+MigrationStatus PageMapping::drainPendingMigrations(uint64_t &tick) {
+  while (!pendingMigrationOrder.empty()) {
+    LCA lca = pendingMigrationOrder.front();
+    MigrationStatus status =
+        executePendingMigration(lca, MigrationTrigger::ListFull, tick);
+
+    if (status != MigrationStatus::Success) {
+      return status;
+    }
+  }
+
+  return MigrationStatus::Success;
 }
 
 void PageMapping::format(LPNRange &range, uint64_t &tick) {
-  PAL::Request req(param.ioUnitInPage);
-  std::vector<uint32_t> list;
-  auto &region = getRegion(range.tier);
+  std::array<std::vector<uint32_t>, 2> blocksToReclaim;
 
-  req.tier = region.tier;
-  req.ioFlag.set();
+  if (!isValidLogicalRange(range.slpn, range.nlp,
+                           param.globalLogicalPages)) {
+    panic("ftl: format LPN range is outside global logical capacity");
+  }
 
-  for (auto iter = region.table.begin(); iter != region.table.end();) {
+  LCA formatStart = lpnToLca(range.slpn, 0, bitsetSize);
+  LCA formatEnd = lpnToLca(range.slpn + range.nlp, 0, bitsetSize);
+
+  for (auto iter = pendingMigrationOrder.begin();
+       iter != pendingMigrationOrder.end();) {
+    LCA lca = *iter++;
+
+    if (lca >= formatStart && lca < formatEnd) {
+      cancelPendingMigration(lca, CancellationReason::Format);
+    }
+  }
+
+  for (auto iter = table.begin(); iter != table.end();) {
     if (iter->first >= range.slpn && iter->first < range.slpn + range.nlp) {
       auto &mappingList = iter->second;
 
-      // Do trim
       for (uint32_t idx = 0; idx < bitsetSize; idx++) {
         auto &mapping = mappingList.at(idx);
 
-        if (!checkMappingAddress(region, mapping,
-                                 "ftl: format mapping points outside selected region")) {
+        if (!mapping.valid) {
           continue;
         }
 
-        auto block = region.blocks.find(mapping.first);
+        if (!checkMappingAddress(
+                mapping, "ftl: format mapping points outside its tier")) {
+          panic("ftl: valid format mapping disappeared");
+        }
+
+        auto &region = getRegion(mapping.tier);
+        auto block = region.blocks.find(mapping.block);
 
         if (block == region.blocks.end()) {
           panic("Block is not in use");
         }
 
-        block->second.invalidate(mapping.second, idx);
+        block->second.invalidate(mapping.page, idx);
 
         // Collect block indices
-        list.push_back(mapping.first);
+        blocksToReclaim.at(tierIndex(mapping.tier)).push_back(mapping.block);
+        mapping = MappingEntry();
       }
 
-      iter = region.table.erase(iter);
+      bool mappingEmpty = true;
+
+      for (auto &mapping : mappingList) {
+        if (mapping.valid) {
+          mappingEmpty = false;
+          break;
+        }
+      }
+
+      if (mappingEmpty) {
+        iter = table.erase(iter);
+      }
+      else {
+        iter++;
+      }
     }
     else {
       iter++;
     }
   }
 
-  // Get blocks to erase
-  std::sort(list.begin(), list.end());
-  auto last = std::unique(list.begin(), list.end());
-  list.erase(last, list.end());
+  // Reclaim every affected physical block in its actual tier. A formatted
+  // namespace can share blocks with mappings outside the formatted range;
+  // normal same-tier GC relocation preserves those mappings before erase.
+  for (uint32_t rid = 0; rid < regions.size(); rid++) {
+    auto &region = regions[rid];
+    auto &list = blocksToReclaim[rid];
 
-  // Do GC only in specified blocks
-  doGarbageCollection(list, region, tick);
+    std::sort(list.begin(), list.end());
+    auto last = std::unique(list.begin(), list.end());
+    list.erase(last, list.end());
+
+    // Format is allowed to select a partially written active frontier. Move
+    // such a frontier first so GC never relocates data into a victim block or
+    // leaves the allocator pointing at an erased block.
+    for (uint32_t frontier = 0; frontier < region.lastFreeBlock.size();
+         frontier++) {
+      if (!std::binary_search(list.begin(), list.end(),
+                              region.lastFreeBlock[frontier])) {
+        continue;
+      }
+
+      uint32_t replacement;
+
+      if (!getFreeBlock(region, frontier, replacement)) {
+        panic("ftl: format cannot replace an affected write frontier");
+      }
+
+      region.lastFreeBlock[frontier] = replacement;
+
+      if (region.lastFreeBlockIndex == frontier) {
+        region.lastFreeBlockIOMap.reset();
+      }
+    }
+
+    doGarbageCollection(list, region, tick);
+  }
 
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::FORMAT);
 }
 
+bool PageMapping::getTierSpaceInfo(Tier tier, TierSpaceInfo &info) const {
+  if (!isValidTier(tier)) {
+    return false;
+  }
+
+  const auto &region = getRegion(tier);
+  const size_t rid = tierIndex(tier);
+  const uint64_t cacheReserved = pendingCacheWriteUnitsByTier.at(rid);
+  const uint64_t migrationReserved = pendingMigrationUnitsByTier.at(rid);
+
+  if (cacheReserved >
+      std::numeric_limits<uint64_t>::max() - migrationReserved) {
+    panic("ftl: tier-space reservation counter overflow");
+  }
+
+  const uint64_t pendingReserved = cacheReserved + migrationReserved;
+  const uint64_t rawWritable = countWritableUnitsWithoutGC(region);
+  uint64_t reclaimableInvalid = 0;
+
+  for (const auto &block : region.blocks) {
+    reclaimableInvalid += block.second.getDirtyPageCountRaw();
+  }
+
+  info = TierSpaceInfo();
+  info.tier = tier;
+  info.writablePagesWithoutGC =
+      rawWritable > pendingReserved ? rawWritable - pendingReserved : 0;
+  info.writableBytesWithoutGC =
+      info.writablePagesWithoutGC * (param.pageSize / bitsetSize);
+  info.pendingReservedPages = pendingReserved;
+  info.reclaimableInvalidPages = reclaimableInvalid;
+  info.freePhysicalBlocks = region.nFreeBlocks;
+
+  return true;
+}
+
 Status *PageMapping::getStatus(uint64_t lpnBegin, uint64_t lpnEnd) {
-  status.totalLogicalPages = 0;
+  status.totalLogicalPages = param.globalLogicalPages;
   status.freePhysicalBlocks = 0;
   status.mappedLogicalPages = 0;
 
   for (auto &region : regions) {
-    status.totalLogicalPages += region.totalLogicalPages;
     status.freePhysicalBlocks += region.nFreeBlocks;
+  }
 
-    if (lpnBegin == 0 && lpnEnd >= region.totalLogicalPages) {
-      status.mappedLogicalPages += region.table.size();
-    }
-    else {
-      for (uint64_t lpn = lpnBegin; lpn < lpnEnd; lpn++) {
-        if (region.table.count(lpn) > 0) {
-          status.mappedLogicalPages++;
-        }
+  if (lpnBegin == 0 && lpnEnd >= param.globalLogicalPages) {
+    status.mappedLogicalPages = table.size();
+  }
+  else {
+    for (auto &mappingList : table) {
+      if (mappingList.first >= lpnBegin && mappingList.first < lpnEnd) {
+        status.mappedLogicalPages++;
       }
     }
   }
@@ -508,11 +824,19 @@ Status *PageMapping::getStatus(uint64_t lpnBegin, uint64_t lpnEnd) {
 }
 
 PageMapping::RegionState &PageMapping::getRegion(Tier tier) {
-  return regions[tier == Tier::SLC ? 0 : 1];
+  if (!isValidTier(tier)) {
+    panic("ftl: invalid physical tier");
+  }
+
+  return regions[tierIndex(tier)];
 }
 
 const PageMapping::RegionState &PageMapping::getRegion(Tier tier) const {
-  return regions[tier == Tier::SLC ? 0 : 1];
+  if (!isValidTier(tier)) {
+    panic("ftl: invalid physical tier");
+  }
+
+  return regions[tierIndex(tier)];
 }
 
 bool PageMapping::isInRegion(const RegionState &region,
@@ -520,37 +844,415 @@ bool PageMapping::isInRegion(const RegionState &region,
   return blockIndex >= region.blockBegin && blockIndex < region.blockEnd;
 }
 
-bool PageMapping::checkMappingAddress(RegionState &region,
-                                      std::pair<uint32_t, uint32_t> &mapping,
-                                      const char *message) {
-  if (mapping.first == param.totalPhysicalBlocks &&
-      mapping.second == param.pagesInBlock) {
+bool PageMapping::checkMappingAddress(const MappingEntry &mapping,
+                                      const char *message) const {
+  if (!mapping.valid) {
     return false;
   }
 
-  if (mapping.second >= param.pagesInBlock) {
+  if (!isValidTier(mapping.tier)) {
     panic(message);
   }
 
-  if (!isInRegion(region, mapping.first)) {
+  const auto &region = getRegion(mapping.tier);
+
+  if (mapping.page >= param.pagesInBlock ||
+      !isInRegion(region, mapping.block)) {
     panic(message);
   }
 
   return true;
 }
 
-bool PageMapping::isValidMapping(RegionState &region, uint64_t lpn,
-                                 uint32_t idx) {
-  auto mappingList = region.table.find(lpn);
+void PageMapping::commitMappingReplacement(MappingEntry &current,
+                                           const MappingEntry &replacement,
+                                           uint32_t mappingIndex) {
+  if (!checkMappingAddress(
+          replacement, "ftl: replacement mapping points outside its tier")) {
+    panic("ftl: cannot commit an invalid replacement mapping");
+  }
 
-  if (idx >= bitsetSize || mappingList == region.table.end()) {
+  MappingEntry previous = current;
+
+  // The new physical location becomes authoritative before the old physical
+  // subpage is invalidated.
+  current = replacement;
+
+  if (!previous.valid) {
+    return;
+  }
+
+  if (!checkMappingAddress(previous,
+                           "ftl: previous mapping points outside its tier")) {
+    panic("ftl: valid previous mapping disappeared during commit");
+  }
+
+  if (previous.tier == replacement.tier &&
+      previous.block == replacement.block &&
+      previous.page == replacement.page) {
+    panic("ftl: out-of-place write reused the previous physical location");
+  }
+
+  auto &oldRegion = getRegion(previous.tier);
+  auto oldBlock = oldRegion.blocks.find(previous.block);
+
+  if (oldBlock == oldRegion.blocks.end()) {
+    panic("ftl: previous write block is not in use during commit");
+  }
+
+  oldBlock->second.invalidate(previous.page, mappingIndex);
+}
+
+uint64_t PageMapping::countWritableUnitsWithoutGC(
+    const RegionState &region) const {
+  return countWritableUnits(region, true);
+}
+
+uint64_t PageMapping::countWritableUnits(const RegionState &region,
+                                         bool preserveGCReserve) const {
+  uint64_t writablePhysicalPages = 0;
+
+  for (uint32_t blockIndex : region.lastFreeBlock) {
+    auto block = region.blocks.find(blockIndex);
+
+    if (block == region.blocks.end()) {
+      panic("ftl: active write block is missing");
+    }
+
+    uint32_t nextPage = block->second.getNextWritePageIndex();
+
+    if (nextPage > param.pagesInBlock) {
+      panic("ftl: active write block cursor is out of range");
+    }
+
+    writablePhysicalPages += param.pagesInBlock - nextPage;
+  }
+
+  uint64_t allocatableFreeBlocks = region.nFreeBlocks;
+
+  if (preserveGCReserve) {
+    const float gcThreshold =
+        conf.readFloat(CONFIG_FTL, FTL_GC_THRESHOLD_RATIO);
+    uint64_t gcReserveBlocks = static_cast<uint64_t>(
+        std::ceil(gcThreshold * region.totalPhysicalBlocks));
+
+    allocatableFreeBlocks =
+        region.nFreeBlocks > gcReserveBlocks
+            ? region.nFreeBlocks - gcReserveBlocks
+            : 0;
+  }
+
+  writablePhysicalPages += allocatableFreeBlocks * param.pagesInBlock;
+
+  return writablePhysicalPages * bitsetSize;
+}
+
+bool PageMapping::canAllocate(const RegionState &region, uint64_t units,
+                              ReservationOwner owner,
+                              bool withoutGarbageCollection) const {
+  size_t rid = tierIndex(region.tier);
+  uint64_t cacheReserved = pendingCacheWriteUnitsByTier.at(rid);
+  uint64_t migrationReserved = pendingMigrationUnitsByTier.at(rid);
+  uint64_t ownedUnits = 0;
+
+  switch (owner) {
+    case ReservationOwner::None:
+      break;
+    case ReservationOwner::CacheWrite:
+      if (cacheReserved < units) {
+        panic("ftl: cache write exceeds its target-tier reservation");
+      }
+
+      ownedUnits = units;
+      break;
+    case ReservationOwner::Migration:
+      if (migrationReserved < units) {
+        panic("ftl: migration exceeds its target-tier reservation");
+      }
+
+      ownedUnits = units;
+      break;
+    default:
+      panic("ftl: write has an invalid reservation owner");
+  }
+
+  if (cacheReserved > std::numeric_limits<uint64_t>::max() -
+                          migrationReserved) {
+    panic("ftl: pending reservation counter overflow");
+  }
+
+  uint64_t otherReservations =
+      cacheReserved + migrationReserved - ownedUnits;
+  uint64_t writable =
+      countWritableUnits(region, withoutGarbageCollection);
+
+  return writable >= otherReservations &&
+         units <= writable - otherReservations;
+}
+
+bool PageMapping::canAllocateAfterMigrationCancellation(
+    const RegionState &region, uint64_t units, ReservationOwner owner,
+    const std::array<uint64_t, 2> &migrationReleases,
+    bool withoutGarbageCollection) const {
+  size_t rid = tierIndex(region.tier);
+  uint64_t cacheReserved = pendingCacheWriteUnitsByTier.at(rid);
+  uint64_t migrationReserved = pendingMigrationUnitsByTier.at(rid);
+  uint64_t ownedUnits = 0;
+
+  if (migrationReserved < migrationReleases.at(rid)) {
+    panic("ftl: migration cancellation exceeds pending reservations");
+  }
+
+  switch (owner) {
+    case ReservationOwner::None:
+      break;
+    case ReservationOwner::CacheWrite:
+      if (cacheReserved < units) {
+        panic("ftl: cache write exceeds its target-tier reservation");
+      }
+
+      ownedUnits = units;
+      break;
+    case ReservationOwner::Migration:
+      if (migrationReserved - migrationReleases.at(rid) < units) {
+        panic("ftl: migration exceeds its target-tier reservation");
+      }
+
+      ownedUnits = units;
+      break;
+    default:
+      panic("ftl: write has an invalid reservation owner");
+  }
+
+  uint64_t finalMigration =
+      migrationReserved - migrationReleases.at(rid);
+
+  if (cacheReserved >
+      std::numeric_limits<uint64_t>::max() - finalMigration) {
+    panic("ftl: pending reservation counter overflow");
+  }
+
+  uint64_t otherReservations =
+      cacheReserved + finalMigration - ownedUnits;
+  uint64_t writable =
+      countWritableUnits(region, withoutGarbageCollection);
+
+  return writable >= otherReservations &&
+         units <= writable - otherReservations;
+}
+
+bool PageMapping::calculateFinalReservations(
+    const std::array<uint64_t, 2> &cacheReleases,
+    const std::array<uint64_t, 2> &cacheAdds,
+    const std::array<uint64_t, 2> &migrationReleases,
+    const std::array<uint64_t, 2> &migrationAdds,
+    std::array<uint64_t, 2> &finalCache,
+    std::array<uint64_t, 2> &finalMigration) const {
+  for (size_t rid = 0; rid < regions.size(); rid++) {
+    uint64_t cacheReserved = pendingCacheWriteUnitsByTier.at(rid);
+    uint64_t migrationReserved = pendingMigrationUnitsByTier.at(rid);
+
+    if (cacheReserved < cacheReleases.at(rid) ||
+        migrationReserved < migrationReleases.at(rid)) {
+      panic("ftl: reservation transaction underflow");
+    }
+
+    finalCache.at(rid) = cacheReserved - cacheReleases.at(rid);
+    finalMigration.at(rid) =
+        migrationReserved - migrationReleases.at(rid);
+
+    if (finalCache.at(rid) >
+            std::numeric_limits<uint64_t>::max() - cacheAdds.at(rid) ||
+        finalMigration.at(rid) >
+            std::numeric_limits<uint64_t>::max() - migrationAdds.at(rid)) {
+      panic("ftl: reservation transaction overflow");
+    }
+
+    finalCache.at(rid) += cacheAdds.at(rid);
+    finalMigration.at(rid) += migrationAdds.at(rid);
+
+    if (finalCache.at(rid) >
+        std::numeric_limits<uint64_t>::max() - finalMigration.at(rid)) {
+      panic("ftl: total reservation transaction overflow");
+    }
+
+    if (countWritableUnitsWithoutGC(regions.at(rid)) <
+        finalCache.at(rid) + finalMigration.at(rid)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void PageMapping::removePendingMigration(
+    std::unordered_map<LCA, PendingMigration>::iterator iter,
+    bool releaseReservation, CancellationReason reason) {
+  if (iter == pendingMigrations.end() ||
+      iter->second.orderIterator == pendingMigrationOrder.end() ||
+      *iter->second.orderIterator != iter->first) {
+    panic("ftl: pending migration containers are inconsistent");
+  }
+
+  if (releaseReservation) {
+    releaseMigrationReservation(iter->second.targetTier, 1);
+  }
+
+  pendingMigrationOrder.erase(iter->second.orderIterator);
+  pendingMigrations.erase(iter);
+
+  switch (reason) {
+    case CancellationReason::None:
+      break;
+    case CancellationReason::Write:
+      migrationStat.cancelledByWrite++;
+      break;
+    case CancellationReason::Trim:
+      migrationStat.cancelledByTrim++;
+      break;
+    case CancellationReason::Format:
+      migrationStat.cancelledByFormat++;
+      break;
+  }
+}
+
+void PageMapping::cancelPendingMigration(LCA lca,
+                                         CancellationReason reason) {
+  auto iter = pendingMigrations.find(lca);
+
+  if (iter != pendingMigrations.end()) {
+    removePendingMigration(iter, true, reason);
+  }
+}
+
+void PageMapping::consumeReservation(Tier tier, uint64_t units,
+                                     ReservationOwner owner) {
+  switch (owner) {
+    case ReservationOwner::None:
+      return;
+    case ReservationOwner::CacheWrite:
+      releaseCacheWriteReservation(tier, units);
+      return;
+    case ReservationOwner::Migration:
+      releaseMigrationReservation(tier, units);
+      return;
+    default:
+      panic("ftl: cannot consume an invalid reservation owner");
+  }
+}
+
+bool PageMapping::reserveCacheWrite(Tier tier, uint64_t units) {
+  if (!isValidTier(tier)) {
     return false;
   }
 
-  auto &mapping = mappingList->second.at(idx);
+  auto &region = getRegion(tier);
 
-  return isInRegion(region, mapping.first) &&
-         mapping.second < param.pagesInBlock;
+  if (!canAllocate(region, units, ReservationOwner::None, true)) {
+    return false;
+  }
+
+  auto &reserved = pendingCacheWriteUnitsByTier.at(tierIndex(tier));
+
+  if (reserved > std::numeric_limits<uint64_t>::max() - units) {
+    panic("ftl: cache reservation counter overflow");
+  }
+
+  reserved += units;
+
+  return true;
+}
+
+bool PageMapping::admitCacheWrite(LCA lca, Tier targetTier,
+                                  bool hasOldReservation, Tier oldTier) {
+  if (!isValidTier(targetTier) ||
+      (hasOldReservation && !isValidTier(oldTier)) ||
+      lca >= param.globalLogicalUnits) {
+    return false;
+  }
+
+  std::array<uint64_t, 2> cacheReleases{0, 0};
+  std::array<uint64_t, 2> cacheAdds{0, 0};
+  std::array<uint64_t, 2> migrationReleases{0, 0};
+  std::array<uint64_t, 2> migrationAdds{0, 0};
+  std::array<uint64_t, 2> finalCache{0, 0};
+  std::array<uint64_t, 2> finalMigration{0, 0};
+  auto pending = pendingMigrations.find(lca);
+
+  if (hasOldReservation) {
+    cacheReleases.at(tierIndex(oldTier))++;
+  }
+
+  cacheAdds.at(tierIndex(targetTier))++;
+
+  if (pending != pendingMigrations.end()) {
+    migrationReleases.at(tierIndex(pending->second.targetTier))++;
+  }
+
+  if (!calculateFinalReservations(
+          cacheReleases, cacheAdds, migrationReleases, migrationAdds,
+          finalCache, finalMigration)) {
+    return false;
+  }
+
+  pendingCacheWriteUnitsByTier = finalCache;
+  pendingMigrationUnitsByTier = finalMigration;
+
+  if (pending != pendingMigrations.end()) {
+    removePendingMigration(pending, false, CancellationReason::Write);
+  }
+
+  return true;
+}
+
+void PageMapping::releaseCacheWriteReservation(Tier tier, uint64_t units) {
+  if (!isValidTier(tier)) {
+    panic("ftl: invalid tier while releasing cache reservation");
+  }
+
+  auto &reserved = pendingCacheWriteUnitsByTier.at(tierIndex(tier));
+
+  if (reserved < units) {
+    panic("ftl: cache reservation counter underflow");
+  }
+
+  reserved -= units;
+}
+
+bool PageMapping::reserveMigration(Tier tier, uint64_t units) {
+  if (!isValidTier(tier)) {
+    return false;
+  }
+
+  auto &region = getRegion(tier);
+
+  if (!canAllocate(region, units, ReservationOwner::None, true)) {
+    return false;
+  }
+
+  auto &reserved = pendingMigrationUnitsByTier.at(tierIndex(tier));
+
+  if (reserved > std::numeric_limits<uint64_t>::max() - units) {
+    panic("ftl: migration reservation counter overflow");
+  }
+
+  reserved += units;
+
+  return true;
+}
+
+void PageMapping::releaseMigrationReservation(Tier tier, uint64_t units) {
+  if (!isValidTier(tier)) {
+    panic("ftl: invalid tier while releasing migration reservation");
+  }
+
+  auto &reserved = pendingMigrationUnitsByTier.at(tierIndex(tier));
+
+  if (reserved < units) {
+    panic("ftl: migration reservation counter underflow");
+  }
+
+  reserved -= units;
 }
 
 float PageMapping::freeBlockRatio(RegionState &region) {
@@ -561,75 +1263,79 @@ uint32_t PageMapping::convertBlockIdx(uint32_t blockIdx) {
   return blockIdx % param.pageCountToMaxPerf;
 }
 
-uint32_t PageMapping::getFreeBlock(RegionState &region, uint32_t idx) {
-  uint32_t blockIndex = 0;
-
+bool PageMapping::getFreeBlock(RegionState &region, uint32_t idx,
+                               uint32_t &blockIndex) {
   if (idx >= param.pageCountToMaxPerf) {
     panic("Index out of range");
   }
 
-  if (region.nFreeBlocks > 0) {
-    // Search block which is blockIdx % param.pageCountToMaxPerf == idx
-    auto iter = region.freeBlocks.begin();
-
-    for (; iter != region.freeBlocks.end(); iter++) {
-      blockIndex = iter->getBlockIndex();
-
-      if (!isInRegion(region, blockIndex)) {
-        panic("ftl: free block is outside selected region");
-      }
-
-      if (blockIndex % param.pageCountToMaxPerf == idx) {
-        break;
-      }
-    }
-
-    // Sanity check
-    if (iter == region.freeBlocks.end()) {
-      // Just use first one
-      iter = region.freeBlocks.begin();
-      blockIndex = iter->getBlockIndex();
-
-      if (!isInRegion(region, blockIndex)) {
-        panic("ftl: free block is outside selected region");
-      }
-    }
-
-    // Insert found block to block list
-    if (region.blocks.find(blockIndex) != region.blocks.end()) {
-      panic("Corrupted");
-    }
-
-    region.blocks.emplace(blockIndex, std::move(*iter));
-
-    // Remove found block from free block list
-    region.freeBlocks.erase(iter);
-    region.nFreeBlocks--;
-  }
-  else {
-    panic("No free block left");
+  if (region.nFreeBlocks == 0) {
+    return false;
   }
 
-  return blockIndex;
+  if (region.freeBlocks.empty()) {
+    panic("ftl: free-block count does not match the free-block list");
+  }
+
+  // Search block which is blockIdx % param.pageCountToMaxPerf == idx
+  auto iter = region.freeBlocks.begin();
+
+  for (; iter != region.freeBlocks.end(); iter++) {
+    blockIndex = iter->getBlockIndex();
+
+    if (!isInRegion(region, blockIndex)) {
+      panic("ftl: free block is outside selected region");
+    }
+
+    if (blockIndex % param.pageCountToMaxPerf == idx) {
+      break;
+    }
+  }
+
+  // Sanity check
+  if (iter == region.freeBlocks.end()) {
+    // Just use first one
+    iter = region.freeBlocks.begin();
+    blockIndex = iter->getBlockIndex();
+
+    if (!isInRegion(region, blockIndex)) {
+      panic("ftl: free block is outside selected region");
+    }
+  }
+
+  // Insert found block to block list
+  if (region.blocks.find(blockIndex) != region.blocks.end()) {
+    panic("Corrupted");
+  }
+
+  region.blocks.emplace(blockIndex, std::move(*iter));
+
+  // Remove found block from free block list
+  region.freeBlocks.erase(iter);
+  region.nFreeBlocks--;
+
+  return true;
 }
 
-uint32_t PageMapping::getLastFreeBlock(RegionState &region, Bitset &iomap) {
-  if (!bRandomTweak || (region.lastFreeBlockIOMap & iomap).any()) {
-    // Update lastFreeBlockIndex
-    region.lastFreeBlockIndex++;
+bool PageMapping::getLastFreeBlock(RegionState &region, Bitset &iomap,
+                                   uint32_t &blockIndex) {
+  uint32_t frontier = region.lastFreeBlockIndex;
+  Bitset nextIOMap = region.lastFreeBlockIOMap;
 
-    if (region.lastFreeBlockIndex == param.pageCountToMaxPerf) {
-      region.lastFreeBlockIndex = 0;
+  if (!bRandomTweak || (region.lastFreeBlockIOMap & iomap).any()) {
+    frontier++;
+
+    if (frontier == param.pageCountToMaxPerf) {
+      frontier = 0;
     }
 
-    region.lastFreeBlockIOMap = iomap;
+    nextIOMap = iomap;
   }
   else {
-    region.lastFreeBlockIOMap |= iomap;
+    nextIOMap |= iomap;
   }
 
-  auto freeBlock =
-      region.blocks.find(region.lastFreeBlock.at(region.lastFreeBlockIndex));
+  auto freeBlock = region.blocks.find(region.lastFreeBlock.at(frontier));
 
   // Sanity check
   if (freeBlock == region.blocks.end()) {
@@ -638,13 +1344,22 @@ uint32_t PageMapping::getLastFreeBlock(RegionState &region, Bitset &iomap) {
 
   // If current free block is full, get next block
   if (freeBlock->second.getNextWritePageIndex() == param.pagesInBlock) {
-    region.lastFreeBlock.at(region.lastFreeBlockIndex) =
-        getFreeBlock(region, region.lastFreeBlockIndex);
+    uint32_t nextBlock;
+
+    if (!getFreeBlock(region, frontier, nextBlock)) {
+      return false;
+    }
+
+    region.lastFreeBlock.at(frontier) = nextBlock;
 
     region.bReclaimMore = true;
   }
 
-  return region.lastFreeBlock.at(region.lastFreeBlockIndex);
+  region.lastFreeBlockIndex = frontier;
+  region.lastFreeBlockIOMap = nextIOMap;
+  blockIndex = region.lastFreeBlock.at(frontier);
+
+  return true;
 }
 
 // calculate weight of each block regarding victim selection policy
@@ -773,10 +1488,16 @@ void PageMapping::selectVictimBlock(std::vector<uint32_t> &list,
 
 void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
                                       RegionState &region, uint64_t &tick) {
+  struct GCSource {
+    LCA lca;
+    MappingEntry source;
+    uint32_t mappingIndex;
+  };
+
   PAL::Request req(param.ioUnitInPage);
   std::vector<PAL::Request> readRequests;
-  std::vector<PAL::Request> writeRequests;
   std::vector<PAL::Request> eraseRequests;
+  std::vector<GCSource> sources;
   std::vector<uint64_t> lpns;
   Bitset bit(param.ioUnitInPage);
   uint64_t beginAt;
@@ -810,14 +1531,6 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
           bit.set();
         }
 
-        // Retrive free block
-        auto freeBlock = region.blocks.find(getLastFreeBlock(region, bit));
-
-        if (freeBlock == region.blocks.end() ||
-            !isInRegion(region, freeBlock->first)) {
-          panic("ftl: GC destination block is outside selected region");
-        }
-
         // Issue Read
         req.blockIndex = block->first;
         req.pageIndex = pageIndex;
@@ -825,46 +1538,35 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
 
         readRequests.push_back(req);
 
-        // Update mapping table
-        uint32_t newBlockIdx = freeBlock->first;
-
+        // Resolve and validate every reverse-mapped logical sub-entry before
+        // any victim data is moved or invalidated.
         for (uint32_t idx = 0; idx < bitsetSize; idx++) {
           if (bit.test(idx)) {
-            // Invalidate
-            block->second.invalidate(pageIndex, idx);
+            LPN lpn = lpns.at(idx);
+            LCA lca = lpnToLca(lpn, idx, bitsetSize);
+            auto mappingList = table.find(lpn);
 
-            auto mappingList = region.table.find(lpns.at(idx));
-
-            if (mappingList == region.table.end()) {
-              panic("Invalid mapping table entry");
+            if (mappingList == table.end()) {
+              panic("ftl: GC reverse mapping has no global table entry");
             }
 
-            pDRAM->read(&(*mappingList), 8 * param.ioUnitInPage, tick);
+            pDRAM->read(&(*mappingList),
+                        sizeof(MappingEntry) * bitsetSize, tick);
 
             auto &mapping = mappingList->second.at(idx);
 
-            uint32_t newPageIdx = freeBlock->second.getNextWritePageIndex(idx);
-
-            mapping.first = newBlockIdx;
-            mapping.second = newPageIdx;
-
-            freeBlock->second.write(newPageIdx, lpns.at(idx), idx, beginAt);
-
-            // Issue Write
-            req.blockIndex = newBlockIdx;
-            req.pageIndex = newPageIdx;
-
-            if (bRandomTweak) {
-              req.ioFlag.reset();
-              req.ioFlag.set(idx);
-            }
-            else {
-              req.ioFlag.set();
+            if (!checkMappingAddress(
+                    mapping, "ftl: GC found an invalid global mapping") ||
+                mapping.tier != region.tier || mapping.block != block->first ||
+                mapping.page != pageIndex) {
+              panic("ftl: stale or inconsistent reverse mapping during GC");
             }
 
-            writeRequests.push_back(req);
+            if (!block->second.read(pageIndex, idx, tick)) {
+              panic("ftl: GC reverse mapping points to invalid victim data");
+            }
 
-            region.stat.validPageCopies++;
+            sources.push_back({lca, mapping, idx});
           }
         }
 
@@ -890,12 +1592,105 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
     readFinishedAt = MAX(readFinishedAt, beginAt);
   }
 
-  for (auto &iter : writeRequests) {
+  // Every source page is now available in the GC data path. Relocate each
+  // logical sub-entry exactly once, selecting its queued migration target when
+  // present or the victim tier otherwise.
+  for (const auto &source : sources) {
     beginAt = readFinishedAt;
+    LPN lpn = lcaToLpn(source.lca, bitsetSize);
+    auto mappingList = table.find(lpn);
 
-    pPAL->write(iter, beginAt);
+    if (mappingList == table.end()) {
+      panic("ftl: GC source mapping disappeared after victim read");
+    }
+
+    auto &mapping = mappingList->second.at(source.mappingIndex);
+
+    if (!checkMappingAddress(
+            mapping, "ftl: GC source mapping became invalid") ||
+        mapping.tier != source.source.tier ||
+        mapping.block != source.source.block ||
+        mapping.page != source.source.page) {
+      panic("ftl: stale or inconsistent reverse mapping during GC commit");
+    }
+
+    auto pending = pendingMigrations.find(source.lca);
+
+    if (pending != pendingMigrations.end() &&
+        pending->second.targetTier == region.tier) {
+      // The request is already satisfied by the current tier, but the victim
+      // data still needs ordinary same-tier relocation before erase.
+      removePendingMigration(pending, true);
+      pending = pendingMigrations.end();
+    }
+
+    if (pending != pendingMigrations.end()) {
+      if (pending->second.targetTier == region.tier) {
+        panic("ftl: stale same-tier migration survived GC no-op removal");
+      }
+
+      MigrationStatus status = executePendingMigration(
+          source.lca, MigrationTrigger::GarbageCollection, beginAt,
+          &source.source, true);
+
+      if (status != MigrationStatus::Success) {
+        panic("ftl: GC could not honor a reserved pending migration");
+      }
+    }
+    else {
+      Bitset relocationIOMap(param.ioUnitInPage);
+
+      if (bRandomTweak) {
+        relocationIOMap.set(source.mappingIndex);
+      }
+      else {
+        relocationIOMap.set();
+      }
+
+      // Normal GC consumes the source tier's configured reserve and never
+      // chooses a cross-tier destination on its own.
+      uint32_t destinationBlock;
+
+      if (!getLastFreeBlock(region, relocationIOMap, destinationBlock)) {
+        panic("ftl: GC cannot allocate its reserved same-tier destination");
+      }
+
+      auto freeBlock = region.blocks.find(destinationBlock);
+
+      if (freeBlock == region.blocks.end() ||
+          !isInRegion(region, freeBlock->first)) {
+        panic("ftl: GC destination block is outside victim tier");
+      }
+
+      uint32_t destinationPage =
+          freeBlock->second.getNextWritePageIndex(source.mappingIndex);
+
+      if (!freeBlock->second.write(destinationPage, lpn,
+                                   source.mappingIndex, beginAt)) {
+        panic("ftl: GC same-tier destination is not writable");
+      }
+
+      PAL::Request writeRequest(param.ioUnitInPage);
+      writeRequest.tier = region.tier;
+      writeRequest.blockIndex = destinationBlock;
+      writeRequest.pageIndex = destinationPage;
+      writeRequest.ioFlag = relocationIOMap;
+      pPAL->write(writeRequest, beginAt);
+
+      if (mapping.tier != source.source.tier ||
+          mapping.block != source.source.block ||
+          mapping.page != source.source.page) {
+        panic("ftl: GC mapping changed before same-tier commit");
+      }
+
+      commitMappingReplacement(
+          mapping,
+          MappingEntry(region.tier, destinationBlock, destinationPage),
+          source.mappingIndex);
+    }
 
     writeFinishedAt = MAX(writeFinishedAt, beginAt);
+    region.stat.validPageCopies++;
   }
 
   for (auto &iter : eraseRequests) {
@@ -910,31 +1705,32 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::DO_GARBAGE_COLLECTION);
 }
 
-void PageMapping::readInternal(Request &req, RegionState &region,
-                               uint64_t &tick) {
+void PageMapping::readInternal(Request &req, uint64_t &tick) {
   PAL::Request palRequest(req);
   uint64_t beginAt;
   uint64_t finishedAt = tick;
 
-  auto mappingList = region.table.find(req.lpn);
+  auto mappingList = table.find(req.lpn);
 
-  if (mappingList != region.table.end()) {
+  if (mappingList != table.end()) {
     if (bRandomTweak) {
-      pDRAM->read(&(*mappingList), 8 * req.ioFlag.count(), tick);
+      pDRAM->read(&(*mappingList),
+                  sizeof(MappingEntry) * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&(*mappingList), 8, tick);
+      pDRAM->read(&(*mappingList), sizeof(MappingEntry), tick);
     }
 
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
       if (req.ioFlag.test(idx) || !bRandomTweak) {
         auto &mapping = mappingList->second.at(idx);
 
-        if (checkMappingAddress(
-                region, mapping,
-                "ftl: read mapping points outside selected region")) {
-          palRequest.blockIndex = mapping.first;
-          palRequest.pageIndex = mapping.second;
+        if (checkMappingAddress(mapping,
+                                "ftl: read mapping points outside its tier")) {
+          auto &region = getRegion(mapping.tier);
+          palRequest.tier = mapping.tier;
+          palRequest.blockIndex = mapping.block;
+          palRequest.pageIndex = mapping.page;
 
           if (bRandomTweak) {
             palRequest.ioFlag.reset();
@@ -952,7 +1748,9 @@ void PageMapping::readInternal(Request &req, RegionState &region,
 
           beginAt = tick;
 
-          block->second.read(palRequest.pageIndex, idx, beginAt);
+          if (!block->second.read(palRequest.pageIndex, idx, beginAt)) {
+            panic("ftl: global read mapping points to invalid physical data");
+          }
           pPAL->read(palRequest, beginAt);
 
           finishedAt = MAX(finishedAt, beginAt);
@@ -965,41 +1763,50 @@ void PageMapping::readInternal(Request &req, RegionState &region,
   }
 }
 
-void PageMapping::writeInternal(Request &req, RegionState &region,
+bool PageMapping::writeInternal(Request &req, RegionState &region,
                                 uint64_t &tick, bool sendToPAL) {
   PAL::Request palRequest(req);
-  std::unordered_map<uint32_t, Block>::iterator block;
-  auto mappingList = region.table.find(req.lpn);
+  auto mappingList = table.find(req.lpn);
   uint64_t beginAt;
   uint64_t finishedAt = tick;
   bool readBeforeWrite = false;
 
-  if (mappingList != region.table.end()) {
+  // Validate every existing source before changing allocator or physical
+  // state. Mixed-tier sub-entries are expected and resolved independently.
+  if (mappingList != table.end()) {
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
       if (req.ioFlag.test(idx) || !bRandomTweak) {
         auto &mapping = mappingList->second.at(idx);
 
-        if (checkMappingAddress(
-                region, mapping,
-                "ftl: overwrite mapping points outside selected region")) {
-          block = region.blocks.find(mapping.first);
+        if (checkMappingAddress(mapping,
+                                "ftl: overwrite source is inconsistent")) {
+          auto &oldRegion = getRegion(mapping.tier);
+          auto oldBlock = oldRegion.blocks.find(mapping.block);
 
-          if (block == region.blocks.end()) {
-            panic("Block is not in use");
+          if (oldBlock == oldRegion.blocks.end()) {
+            panic("ftl: overwrite source block is not in use");
           }
-
-          // Invalidate current page
-          block->second.invalidate(mapping.second, idx);
         }
       }
     }
   }
-  else {
-    // Create empty mapping
-    auto ret = region.table.emplace(
-        req.lpn,
-        std::vector<std::pair<uint32_t, uint32_t>>(
-            bitsetSize, {param.totalPhysicalBlocks, param.pagesInBlock}));
+
+  // Admission/allocation happens before the global table or old physical
+  // mapping is modified. A normal no-space condition is recoverable.
+  uint32_t targetBlockIndex;
+
+  if (!getLastFreeBlock(region, req.ioFlag, targetBlockIndex)) {
+    return false;
+  }
+
+  auto block = region.blocks.find(targetBlockIndex);
+
+  if (block == region.blocks.end() || !isInRegion(region, block->first)) {
+    panic("ftl: allocated write block is outside target tier");
+  }
+
+  if (mappingList == table.end()) {
+    auto ret = table.emplace(req.lpn, std::vector<MappingEntry>(bitsetSize));
 
     if (!ret.second) {
       panic("Failed to insert new mapping");
@@ -1008,21 +1815,16 @@ void PageMapping::writeInternal(Request &req, RegionState &region,
     mappingList = ret.first;
   }
 
-  // Write data to free block
-  block = region.blocks.find(getLastFreeBlock(region, req.ioFlag));
-
-  if (block == region.blocks.end()) {
-    panic("No such block");
-  }
-
   if (sendToPAL) {
     if (bRandomTweak) {
-      pDRAM->read(&(*mappingList), 8 * req.ioFlag.count(), tick);
-      pDRAM->write(&(*mappingList), 8 * req.ioFlag.count(), tick);
+      pDRAM->read(&(*mappingList),
+                  sizeof(MappingEntry) * req.ioFlag.count(), tick);
+      pDRAM->write(&(*mappingList),
+                   sizeof(MappingEntry) * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&(*mappingList), 8, tick);
-      pDRAM->write(&(*mappingList), 8, tick);
+      pDRAM->read(&(*mappingList), sizeof(MappingEntry), tick);
+      pDRAM->write(&(*mappingList), sizeof(MappingEntry), tick);
     }
   }
 
@@ -1035,17 +1837,17 @@ void PageMapping::writeInternal(Request &req, RegionState &region,
     if (req.ioFlag.test(idx) || !bRandomTweak) {
       uint32_t pageIndex = block->second.getNextWritePageIndex(idx);
       auto &mapping = mappingList->second.at(idx);
+      MappingEntry previous = mapping;
 
       beginAt = tick;
-
-      block->second.write(pageIndex, req.lpn, idx, beginAt);
 
       // Read old data if needed (Only executed when bRandomTweak = false)
       // Maybe some other init procedures want to perform 'partial-write'
       // So check sendToPAL variable
-      if (readBeforeWrite && sendToPAL) {
-        palRequest.blockIndex = mapping.first;
-        palRequest.pageIndex = mapping.second;
+      if (readBeforeWrite && sendToPAL && previous.valid) {
+        palRequest.tier = previous.tier;
+        palRequest.blockIndex = previous.block;
+        palRequest.pageIndex = previous.page;
 
         // We don't need to read old data
         palRequest.ioFlag = req.ioFlag;
@@ -1054,11 +1856,10 @@ void PageMapping::writeInternal(Request &req, RegionState &region,
         pPAL->read(palRequest, beginAt);
       }
 
-      // update mapping to table
-      mapping.first = block->first;
-      mapping.second = pageIndex;
+      block->second.write(pageIndex, req.lpn, idx, beginAt);
 
       if (sendToPAL) {
+        palRequest.tier = region.tier;
         palRequest.blockIndex = block->first;
         palRequest.pageIndex = pageIndex;
 
@@ -1072,6 +1873,11 @@ void PageMapping::writeInternal(Request &req, RegionState &region,
 
         pPAL->write(palRequest, beginAt);
       }
+
+      // Commit only after the target program has been issued. The helper
+      // publishes the new global mapping before invalidating the old page.
+      commitMappingReplacement(
+          mapping, MappingEntry(region.tier, block->first, pageIndex), idx);
 
       finishedAt = MAX(finishedAt, beginAt);
     }
@@ -1109,18 +1915,20 @@ void PageMapping::writeInternal(Request &req, RegionState &region,
     region.stat.gcCount++;
     region.stat.reclaimedBlocks += list.size();
   }
+
+  return true;
 }
 
-void PageMapping::trimInternal(Request &req, RegionState &region,
-                               uint64_t &tick) {
-  auto mappingList = region.table.find(req.lpn);
+void PageMapping::trimInternal(Request &req, uint64_t &tick) {
+  auto mappingList = table.find(req.lpn);
 
-  if (mappingList != region.table.end()) {
+  if (mappingList != table.end()) {
     if (bRandomTweak) {
-      pDRAM->read(&(*mappingList), 8 * req.ioFlag.count(), tick);
+      pDRAM->read(&(*mappingList),
+                  sizeof(MappingEntry) * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&(*mappingList), 8, tick);
+      pDRAM->read(&(*mappingList), sizeof(MappingEntry), tick);
     }
 
     // Do trim
@@ -1131,26 +1939,28 @@ void PageMapping::trimInternal(Request &req, RegionState &region,
 
       auto &mapping = mappingList->second.at(idx);
 
-      if (!checkMappingAddress(region, mapping,
-                               "ftl: trim mapping points outside selected region")) {
+      if (!checkMappingAddress(
+              mapping, "ftl: trim mapping points outside its tier")) {
         continue;
       }
 
-      auto block = region.blocks.find(mapping.first);
+      auto &region = getRegion(mapping.tier);
+      auto block = region.blocks.find(mapping.block);
 
       if (block == region.blocks.end()) {
         panic("Block is not in use");
       }
 
-      block->second.invalidate(mapping.second, idx);
-      mapping = {param.totalPhysicalBlocks, param.pagesInBlock};
+      block->second.invalidate(mapping.page, idx);
+      mapping = MappingEntry();
     }
 
     bool mappingEmpty = true;
 
     for (auto &mapping : mappingList->second) {
-      if (checkMappingAddress(region, mapping,
-                              "ftl: trim mapping points outside selected region")) {
+      if (mapping.valid) {
+        checkMappingAddress(mapping,
+                            "ftl: trim mapping points outside its tier");
         mappingEmpty = false;
 
         break;
@@ -1158,7 +1968,7 @@ void PageMapping::trimInternal(Request &req, RegionState &region,
     }
 
     if (mappingEmpty) {
-      region.table.erase(mappingList);
+      table.erase(mappingList);
     }
 
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::TRIM_INTERNAL);
@@ -1225,7 +2035,7 @@ void PageMapping::eraseInternal(PAL::Request &req, RegionState &region,
 float PageMapping::calculateWearLeveling(RegionState &region) {
   uint64_t totalEraseCnt = 0;
   uint64_t sumOfSquaredEraseCnt = 0;
-  uint64_t numOfBlocks = region.totalLogicalBlocks;
+  uint64_t numOfBlocks = region.totalPhysicalBlocks;
   uint64_t eraseCnt;
 
   for (auto &iter : region.blocks) {
@@ -1309,6 +2119,50 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.name = prefix + "page_mapping.tlc.wear_leveling";
   temp.desc = "Wear-leveling factor";
   list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.slc.pending_cache_write_units";
+  temp.desc = "Pending SLC cache-write reservations";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.tlc.pending_cache_write_units";
+  temp.desc = "Pending TLC cache-write reservations";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.slc.pending_migration_units";
+  temp.desc = "Pending SLC migration reservations";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.tlc.pending_migration_units";
+  temp.desc = "Pending TLC migration reservations";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.current_queue_entries";
+  temp.desc = "Current deferred migration queue entries";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.maximum_queue_entries";
+  temp.desc = "Maximum deferred migration queue entries";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.executed_by_gc";
+  temp.desc = "Migrations executed by GC piggyback";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.executed_by_list_full";
+  temp.desc = "Migrations executed by list-full drain";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.cancelled_by_write";
+  temp.desc = "Pending migrations cancelled by admitted Write";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.cancelled_by_trim";
+  temp.desc = "Pending migrations cancelled by Trim";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.migration.cancelled_by_format";
+  temp.desc = "Pending migrations cancelled by Format";
+  list.push_back(temp);
 }
 
 void PageMapping::getStatValues(std::vector<double> &values) {
@@ -1319,12 +2173,27 @@ void PageMapping::getStatValues(std::vector<double> &values) {
     values.push_back(region.stat.validPageCopies);
     values.push_back(calculateWearLeveling(region));
   }
+
+  values.push_back(pendingCacheWriteUnitsByTier.at(tierIndex(Tier::SLC)));
+  values.push_back(pendingCacheWriteUnitsByTier.at(tierIndex(Tier::TLC)));
+  values.push_back(pendingMigrationUnitsByTier.at(tierIndex(Tier::SLC)));
+  values.push_back(pendingMigrationUnitsByTier.at(tierIndex(Tier::TLC)));
+  values.push_back(pendingMigrations.size());
+  values.push_back(migrationStat.maximumQueueEntries);
+  values.push_back(migrationStat.executedByGarbageCollection);
+  values.push_back(migrationStat.executedByListFull);
+  values.push_back(migrationStat.cancelledByWrite);
+  values.push_back(migrationStat.cancelledByTrim);
+  values.push_back(migrationStat.cancelledByFormat);
 }
 
 void PageMapping::resetStatValues() {
   for (auto &region : regions) {
     memset(&region.stat, 0, sizeof(region.stat));
   }
+
+  memset(&migrationStat, 0, sizeof(migrationStat));
+  migrationStat.maximumQueueEntries = pendingMigrations.size();
 }
 
 }  // namespace FTL

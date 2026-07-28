@@ -38,11 +38,6 @@ typedef enum {
   TRACE_GROUP_LBA_OFFSET,
   TRACE_GROUP_LBA_LENGTH,
   TRACE_GROUP_TIER,
-  TRACE_GROUP_MIGRATION_SRC_TIER,
-  TRACE_GROUP_MIGRATION_SRC_LBA,
-  TRACE_GROUP_MIGRATION_DST_TIER,
-  TRACE_GROUP_MIGRATION_DST_LBA,
-  TRACE_GROUP_MIGRATION_NLB,
   TRACE_GROUP_SEC,
   TRACE_GROUP_MILI_SEC,
   TRACE_GROUP_MICRO_SEC,
@@ -73,11 +68,6 @@ class TraceConfig : public SimpleSSD::BaseConfig {
   uint32_t groupLBAOffset;
   uint32_t groupLBALength;
   uint32_t groupTier;
-  uint32_t groupMigrationSrcTier;
-  uint32_t groupMigrationSrcLBA;
-  uint32_t groupMigrationDstTier;
-  uint32_t groupMigrationDstLBA;
-  uint32_t groupMigrationNLB;
   uint32_t groupSecond;
   uint32_t groupMiliSecond;
   uint32_t groupMicroSecond;

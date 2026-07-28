@@ -21,21 +21,44 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 
 namespace SimpleSSD {
+
+MappingEntry::_MappingEntry()
+    : valid(false),
+      tier(Tier::TLC),
+      block(std::numeric_limits<uint32_t>::max()),
+      page(std::numeric_limits<uint32_t>::max()) {}
+
+MappingEntry::_MappingEntry(Tier t, uint32_t b, uint32_t p)
+    : valid(true), tier(t), block(b), page(p) {}
+
+MigrationRequest::_MigrationRequest()
+    : startLCA(0),
+      count(0),
+      targetTier(Tier::TLC),
+      status(MigrationStatus::Success) {}
+
+MigrationRequest::_MigrationRequest(LCA lca, uint64_t n, Tier tier)
+    : startLCA(lca),
+      count(n),
+      targetTier(tier),
+      status(MigrationStatus::Success) {}
+
+TierSpaceInfo::_TierSpaceInfo()
+    : version(1),
+      tier(Tier::TLC),
+      writablePagesWithoutGC(0),
+      writableBytesWithoutGC(0),
+      pendingReservedPages(0),
+      reclaimableInvalidPages(0),
+      freePhysicalBlocks(0) {}
 
 LPNRange::_LPNRange() : slpn(0), nlp(0), tier(Tier::TLC) {}
 
 LPNRange::_LPNRange(uint64_t s, uint64_t n)
     : slpn(s), nlp(n), tier(Tier::TLC) {}
-
-MigrationRequest::_MigrationRequest()
-    : srcTier(Tier::TLC),
-      srcLPN(0),
-      dstTier(Tier::TLC),
-      dstLPN(0),
-      nlp(0),
-      success(false) {}
 
 namespace HIL {
 
@@ -82,15 +105,23 @@ Request::_Request(HIL::Request &r)
 namespace FTL {
 
 Request::_Request(uint32_t iocount)
-    : reqID(0), reqSubID(0), tier(Tier::TLC), lpn(0), ioFlag(iocount) {}
+    : reqID(0),
+      reqSubID(0),
+      tier(Tier::TLC),
+      lpn(0),
+      ioFlag(iocount),
+      reservationOwner(ReservationOwner::None),
+      supersedesPendingMigration(true) {}
 
 Request::_Request(uint32_t iocount, ICL::Request &r)
     : reqID(r.reqID),
       reqSubID(r.reqSubID),
       tier(r.tier),
-      lpn(r.range.slpn / iocount),
-      ioFlag(iocount) {
-  ioFlag.set(r.range.slpn % iocount);
+      lpn(lcaToLpn(r.range.slpn, iocount)),
+      ioFlag(iocount),
+      reservationOwner(ReservationOwner::None),
+      supersedesPendingMigration(true) {
+  ioFlag.set(lcaToMappingIndex(r.range.slpn, iocount));
 }
 
 }  // namespace FTL

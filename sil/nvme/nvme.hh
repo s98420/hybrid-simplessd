@@ -75,10 +75,14 @@ typedef struct _CommandEntry {
 typedef struct _IOWrapper {
   uint64_t id;
   PRP *prp;
+  BIL::BIO_TYPE type;
+  std::shared_ptr<SimpleSSD::TierSpaceInfo> tierSpace;
   std::function<void(uint64_t, uint16_t)> bioCallback;
 
-  _IOWrapper(uint64_t i, PRP *p, std::function<void(uint64_t, uint16_t)> &f)
-      : id(i), prp(p), bioCallback(f) {}
+  _IOWrapper(uint64_t i, PRP *p, BIL::BIO_TYPE t,
+             std::shared_ptr<SimpleSSD::TierSpaceInfo> q,
+             std::function<void(uint64_t, uint16_t)> &f)
+      : id(i), prp(p), type(t), tierSpace(q), bioCallback(f) {}
 } IOWrapper;
 
 class Driver : public BIL::DriverInterface, SimpleSSD::HIL::NVMe::Interface {

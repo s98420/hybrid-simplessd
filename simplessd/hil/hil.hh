@@ -67,6 +67,7 @@ class HIL : public StatObject {
   void getLPNInfo(uint64_t &, uint32_t &);
   void getTierLPNInfo(Tier, uint64_t &, uint32_t &);
   uint64_t getUsedPageCount(uint64_t, uint64_t);
+  bool getTierSpaceInfo(Tier, TierSpaceInfo &) const;
 
   void getStatList(std::vector<Stats> &, std::string) override;
   void getStatValues(std::vector<double> &) override;

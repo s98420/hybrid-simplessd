@@ -51,16 +51,40 @@ class PageMapping : public AbstractFTL {
     uint64_t validPageCopies;
   } RegionStat;
 
+  typedef struct _PendingMigration {
+    Tier targetTier;
+    uint64_t enqueueTick;
+    std::list<LCA>::iterator orderIterator;
+
+    _PendingMigration(Tier tier, uint64_t tick,
+                      std::list<LCA>::iterator iter)
+        : targetTier(tier), enqueueTick(tick), orderIterator(iter) {}
+  } PendingMigration;
+
+  enum class CancellationReason : uint8_t {
+    None = 0,
+    Write,
+    Trim,
+    Format,
+  };
+
+  typedef struct _MigrationStat {
+    uint64_t maximumQueueEntries;
+    uint64_t executedByGarbageCollection;
+    uint64_t executedByListFull;
+    uint64_t cancelledByWrite;
+    uint64_t cancelledByTrim;
+    uint64_t cancelledByFormat;
+  } MigrationStat;
+
   typedef struct _RegionState {
     Tier tier;
     uint32_t blockBegin;
     uint32_t blockEnd;
     uint64_t totalPhysicalBlocks;
-    uint64_t totalLogicalBlocks;
-    uint64_t totalLogicalPages;
+    uint64_t placementLogicalBlocks;
+    uint64_t placementLogicalPages;
 
-    std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>>
-        table;
     std::unordered_map<uint32_t, Block> blocks;
     std::list<Block> freeBlocks;
     uint32_t nFreeBlocks;
@@ -76,14 +100,21 @@ class PageMapping : public AbstractFTL {
   } RegionState;
 
   std::array<RegionState, 2> regions;
+  std::unordered_map<LPN, std::vector<MappingEntry>> table;
+  std::array<uint64_t, 2> pendingCacheWriteUnitsByTier;
+  std::array<uint64_t, 2> pendingMigrationUnitsByTier;
+  uint64_t migrationListLimit;
+  std::list<LCA> pendingMigrationOrder;
+  std::unordered_map<LCA, PendingMigration> pendingMigrations;
+  MigrationStat migrationStat;
 
   RegionState &getRegion(Tier);
   const RegionState &getRegion(Tier) const;
   bool isInRegion(const RegionState &, uint32_t) const;
   float freeBlockRatio(RegionState &);
   uint32_t convertBlockIdx(uint32_t);
-  uint32_t getFreeBlock(RegionState &, uint32_t);
-  uint32_t getLastFreeBlock(RegionState &, Bitset &);
+  bool getFreeBlock(RegionState &, uint32_t, uint32_t &);
+  bool getLastFreeBlock(RegionState &, Bitset &, uint32_t &);
   void calculateVictimWeight(std::vector<std::pair<uint32_t, float>> &,
                              RegionState &, const EVICT_POLICY, uint64_t);
   void selectVictimBlock(std::vector<uint32_t> &, RegionState &, uint64_t &);
@@ -92,13 +123,34 @@ class PageMapping : public AbstractFTL {
   float calculateWearLeveling(RegionState &);
   void calculateTotalPages(RegionState &, uint64_t &, uint64_t &);
 
-  void readInternal(Request &, RegionState &, uint64_t &);
-  void writeInternal(Request &, RegionState &, uint64_t &, bool = true);
-  void trimInternal(Request &, RegionState &, uint64_t &);
+  void readInternal(Request &, uint64_t &);
+  bool writeInternal(Request &, RegionState &, uint64_t &, bool = true);
+  void trimInternal(Request &, uint64_t &);
   void eraseInternal(PAL::Request &, RegionState &, uint64_t &);
-  bool checkMappingAddress(RegionState &, std::pair<uint32_t, uint32_t> &,
-                           const char *);
-  bool isValidMapping(RegionState &, uint64_t, uint32_t);
+  bool checkMappingAddress(const MappingEntry &, const char *) const;
+  void commitMappingReplacement(MappingEntry &, const MappingEntry &,
+                                uint32_t);
+  uint64_t countWritableUnitsWithoutGC(const RegionState &) const;
+  uint64_t countWritableUnits(const RegionState &, bool) const;
+  bool canAllocate(const RegionState &, uint64_t, ReservationOwner,
+                   bool) const;
+  bool canAllocateAfterMigrationCancellation(
+      const RegionState &, uint64_t, ReservationOwner,
+      const std::array<uint64_t, 2> &, bool) const;
+  void consumeReservation(Tier, uint64_t, ReservationOwner);
+  bool calculateFinalReservations(
+      const std::array<uint64_t, 2> &, const std::array<uint64_t, 2> &,
+      const std::array<uint64_t, 2> &, const std::array<uint64_t, 2> &,
+      std::array<uint64_t, 2> &, std::array<uint64_t, 2> &) const;
+  void removePendingMigration(
+      std::unordered_map<LCA, PendingMigration>::iterator, bool,
+      CancellationReason = CancellationReason::None);
+  void cancelPendingMigration(LCA, CancellationReason);
+  MigrationStatus enqueueMigration(MigrationRequest &, uint64_t);
+  MigrationStatus executePendingMigration(
+      LCA, MigrationTrigger, uint64_t &, const MappingEntry * = nullptr,
+      bool = false);
+  MigrationStatus drainPendingMigrations(uint64_t &);
 
  public:
   PageMapping(ConfigReader &, Parameter &, PAL::PAL *, DRAM::AbstractDRAM *);
@@ -107,11 +159,22 @@ class PageMapping : public AbstractFTL {
   bool initialize() override;
 
   void read(Request &, uint64_t &) override;
-  void write(Request &, uint64_t &) override;
+  bool write(Request &, uint64_t &) override;
   void trim(Request &, uint64_t &) override;
-  bool migrate(MigrationRequest &, uint64_t &) override;
+  void migrate(MigrationRequest &, uint64_t &) override;
+  void drainMigrations(MigrationRequest &, uint64_t &) override;
+  bool migrationDrainRequired() const override;
+  std::vector<LCA> getPendingMigrationLCAs() const override;
+
+  bool reserveCacheWrite(Tier, uint64_t) override;
+  bool admitCacheWrite(LCA, Tier, bool, Tier) override;
+  void releaseCacheWriteReservation(Tier, uint64_t) override;
+  bool reserveMigration(Tier, uint64_t) override;
+  void releaseMigrationReservation(Tier, uint64_t) override;
 
   void format(LPNRange &, uint64_t &) override;
+
+  bool getTierSpaceInfo(Tier, TierSpaceInfo &) const override;
 
   Status *getStatus(uint64_t, uint64_t) override;
 

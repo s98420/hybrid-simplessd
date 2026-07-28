@@ -82,7 +82,6 @@ class RequestGenerator : public IOGenerator {
   bool enableMigration;
   float migrationRatio;
   MIGRATION_DIRECTION migrationDirection;
-  bool migrationAvoidOverwrite;
   uint64_t migration_count;
   uint64_t migration_success_count;
   uint64_t migration_failed_count;
@@ -94,7 +93,6 @@ class RequestGenerator : public IOGenerator {
   bool nextIOIsRead();
   bool generateMigration(BIL::BIO &);
   bool rangeValid(uint8_t, uint64_t, uint64_t);
-  bool rangeInvalid(uint8_t, uint64_t, uint64_t);
   void markRange(uint8_t, uint64_t, uint64_t, bool);
   void rescheduleSubmit(uint64_t);
 

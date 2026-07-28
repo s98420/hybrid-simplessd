@@ -219,20 +219,12 @@ uint64_t GenericCache::getCacheLatency() {
   return (core == 0) ? 0 : latency / core;
 }
 
-uint64_t GenericCache::makeCacheKey(Tier tier, uint64_t lca) {
-  if (lca & (1ull << 63)) {
-    panic("icl: LCA too large for packed tier cache key");
-  }
-
-  return ((uint64_t)(tier == Tier::SLC ? 0 : 1) << 63) | lca;
+uint64_t GenericCache::makeCacheKey(uint64_t lca) {
+  return lca;
 }
 
 uint64_t GenericCache::getKeyLCA(uint64_t key) {
-  return key & ~(1ull << 63);
-}
-
-Tier GenericCache::getKeyTier(uint64_t key) {
-  return (key >> 63) == 0 ? Tier::SLC : Tier::TLC;
+  return key;
 }
 
 uint32_t GenericCache::calcSetIndex(uint64_t key) {
@@ -297,10 +289,9 @@ void GenericCache::checkSequential(Request &req, SequentialDetect &data) {
     return;
   }
 
-  if (data.lastRequest.tier == req.tier &&
-      data.lastRequest.range.slpn * lineSize + data.lastRequest.offset +
-              data.lastRequest.length ==
-          req.range.slpn * lineSize + req.offset) {
+  if (data.lastRequest.range.slpn * lineSize + data.lastRequest.offset +
+          data.lastRequest.length ==
+      req.range.slpn * lineSize + req.offset) {
     if (!data.enabled) {
       data.hitCounter++;
       data.accessCounter += data.lastRequest.offset + data.lastRequest.length;
@@ -320,55 +311,139 @@ void GenericCache::checkSequential(Request &req, SequentialDetect &data) {
   data.lastRequest = req;
 }
 
-void GenericCache::evictCache(uint64_t tick, bool flush) {
-  FTL::Request reqInternal(lineCountInSuperPage);
-  uint64_t beginAt;
+bool GenericCache::prepareDirtyLine(Line &line, LCA lca, Tier targetTier) {
+  if (!isValidTier(targetTier)) {
+    return false;
+  }
+
+  if (!pFTL->admitCacheWrite(lca, targetTier, line.dirty,
+                             line.targetTier)) {
+    return false;
+  }
+
+  line.targetTier = targetTier;
+  line.dirty = true;
+
+  return true;
+}
+
+void GenericCache::cancelDirtyLine(Line &line) {
+  if (line.dirty) {
+    pFTL->releaseCacheWriteReservation(line.targetTier, 1);
+    line.dirty = false;
+  }
+}
+
+void GenericCache::writebackLines(const std::vector<Line *> &lines,
+                                  uint64_t &tick, bool invalidate) {
+  struct Writeback {
+    LPN lpn;
+    Tier tier;
+    Bitset ioFlag;
+
+    Writeback(LPN page, Tier target, uint32_t ioUnits)
+        : lpn(page), tier(target), ioFlag(ioUnits) {}
+  };
+
+  std::vector<Writeback> writes;
   uint64_t finishedAt = tick;
+
+  for (Line *line : lines) {
+    if (line == nullptr || !line->valid || !line->dirty) {
+      continue;
+    }
+
+    if (!isValidTier(line->targetTier)) {
+      panic("icl: dirty cache line has an invalid target tier");
+    }
+
+    LCA lca = getKeyLCA(line->tag);
+    LPN lpn = lcaToLpn(lca, lineCountInSuperPage);
+    uint32_t mappingIndex = lcaToMappingIndex(lca, lineCountInSuperPage);
+    auto iter = std::find_if(
+        writes.begin(), writes.end(),
+        [lpn, line](const Writeback &entry) {
+          return entry.lpn == lpn && entry.tier == line->targetTier;
+        });
+
+    if (iter == writes.end()) {
+      writes.emplace_back(lpn, line->targetTier, lineCountInSuperPage);
+      iter = writes.end() - 1;
+    }
+
+    if (iter->ioFlag.test(mappingIndex)) {
+      panic("icl: duplicate dirty cache sub-entry during writeback");
+    }
+
+    iter->ioFlag.set(mappingIndex);
+  }
+
+  for (auto &write : writes) {
+    FTL::Request reqInternal(lineCountInSuperPage);
+    uint64_t beginAt = tick;
+
+    reqInternal.lpn = write.lpn;
+    reqInternal.tier = write.tier;
+    reqInternal.ioFlag = write.ioFlag;
+    reqInternal.reservationOwner = ReservationOwner::CacheWrite;
+    reqInternal.supersedesPendingMigration = false;
+
+    if (!pFTL->write(reqInternal, beginAt)) {
+      panic("icl: reserved cache writeback could not be allocated");
+    }
+
+    finishedAt = MAX(finishedAt, beginAt);
+  }
+
+  for (Line *line : lines) {
+    if (line == nullptr) {
+      continue;
+    }
+
+    line->dirty = false;
+
+    if (invalidate) {
+      line->valid = false;
+      line->tag = 0;
+    }
+  }
+
+  tick = finishedAt;
+}
+
+void GenericCache::evictCache(uint64_t tick, bool flush) {
+  std::vector<Line *> lines;
+  uint64_t beginAt = tick;
 
   debugprint(LOG_ICL_GENERIC_CACHE, "----- | Begin eviction");
 
   for (uint32_t row = 0; row < lineCountInSuperPage; row++) {
     for (uint32_t col = 0; col < parallelIO; col++) {
-      beginAt = tick;
-
       if (evictData[row][col] == nullptr) {
         continue;
       }
 
-      if (evictData[row][col]->valid && evictData[row][col]->dirty) {
-        uint64_t lca = getKeyLCA(evictData[row][col]->tag);
-
-        reqInternal.lpn = lca / lineCountInSuperPage;
-        reqInternal.tier = evictData[row][col]->tier;
-        reqInternal.ioFlag.reset();
-        reqInternal.ioFlag.set(row);
-
-        pFTL->write(reqInternal, beginAt);
-      }
-
-      if (flush) {
-        evictData[row][col]->valid = false;
-        evictData[row][col]->tag = 0;
-      }
-
-      evictData[row][col]->insertedAt = beginAt;
-      evictData[row][col]->lastAccessed = beginAt;
-      evictData[row][col]->dirty = false;
+      lines.push_back(evictData[row][col]);
       evictData[row][col] = nullptr;
-
-      finishedAt = MAX(finishedAt, beginAt);
     }
+  }
+
+  writebackLines(lines, beginAt, flush);
+
+  for (Line *line : lines) {
+    line->insertedAt = beginAt;
+    line->lastAccessed = beginAt;
   }
 
   debugprint(LOG_ICL_GENERIC_CACHE,
              "----- | End eviction | %" PRIu64 " - %" PRIu64 " (%" PRIu64 ")",
-             tick, finishedAt, finishedAt - tick);
+             tick, beginAt, beginAt - tick);
 }
 
 // True when hit
 bool GenericCache::read(Request &req, uint64_t &tick) {
   bool ret = false;
-  uint64_t reqKey = makeCacheKey(req.tier, req.range.slpn);
+  uint64_t reqKey = makeCacheKey(req.range.slpn);
 
   debugprint(LOG_ICL_GENERIC_CACHE,
              "READ  | REQ %7u-%-4u | LCA %" PRIu64 " | SIZE %" PRIu64,
@@ -444,16 +519,14 @@ bool GenericCache::read(Request &req, uint64_t &tick) {
         // If super-page is disabled, just read all pages from all planes
         if (prefetchMode == MODE_ALL || !bSuperPage) {
           endLCA = beginLCA + lineCountInMaxIO;
-          prefetchTrigger =
-              makeCacheKey(req.tier, beginLCA + lineCountInMaxIO / 2);
+          prefetchTrigger = makeCacheKey(beginLCA + lineCountInMaxIO / 2);
         }
         else {
           endLCA = beginLCA + lineCountInSuperPage;
-          prefetchTrigger =
-              makeCacheKey(req.tier, beginLCA + lineCountInSuperPage / 2);
+          prefetchTrigger = makeCacheKey(beginLCA + lineCountInSuperPage / 2);
         }
 
-        lastPrefetched = makeCacheKey(req.tier, endLCA);
+        lastPrefetched = makeCacheKey(endLCA);
       }
       else {
         beginLCA = req.range.slpn;
@@ -464,7 +537,7 @@ bool GenericCache::read(Request &req, uint64_t &tick) {
         beginAt = tick;
 
         // Check cache
-        uint64_t key = makeCacheKey(req.tier, lca);
+        uint64_t key = makeCacheKey(lca);
 
         if (getValidWay(key, beginAt) != waySize) {
           continue;
@@ -504,7 +577,7 @@ bool GenericCache::read(Request &req, uint64_t &tick) {
         // Read data
         uint64_t lca = getKeyLCA(iter.first);
 
-        reqInternal.tier = getKeyTier(iter.first);
+        reqInternal.tier = req.tier;
         reqInternal.lpn = lca / lineCountInSuperPage;
         reqInternal.ioFlag.reset();
         reqInternal.ioFlag.set(lca % lineCountInSuperPage);
@@ -523,7 +596,7 @@ bool GenericCache::read(Request &req, uint64_t &tick) {
 
         pLine->insertedAt = beginAt;
         pLine->lastAccessed = beginAt;
-        pLine->tier = req.tier;
+        pLine->targetTier = req.tier;
         pLine->tag = iter.first;
 
         if (pLine->tag == reqKey) {
@@ -580,7 +653,15 @@ bool GenericCache::write(Request &req, uint64_t &tick) {
   bool ret = false;
   uint64_t flash = tick;
   bool dirty = false;
-  uint64_t reqKey = makeCacheKey(req.tier, req.range.slpn);
+  uint64_t reqKey = makeCacheKey(req.range.slpn);
+  uint32_t setIdx = 0;
+  uint32_t wayIdx = waySize;
+  auto rejectWrite = [this, &tick]() -> bool {
+    stat.request[1]++;
+    tick += applyLatency(CPU::ICL__GENERIC_CACHE, CPU::WRITE);
+
+    return false;
+  };
 
   debugprint(LOG_ICL_GENERIC_CACHE,
              "WRITE | REQ %7u-%-4u | LCA %" PRIu64 " | SIZE %" PRIu64,
@@ -591,43 +672,81 @@ bool GenericCache::write(Request &req, uint64_t &tick) {
   if (req.length < lineSize) {
     dirty = true;
   }
-  else {
-    pFTL->write(reqInternal, flash);
+
+  if (useReadCaching || useWriteCaching) {
+    setIdx = calcSetIndex(reqKey);
+    wayIdx = getValidWay(reqKey, tick);
+  }
+
+  if (!dirty) {
+    Line *cachedLine =
+        (useReadCaching || useWriteCaching) && wayIdx != waySize
+            ? &cacheData[setIdx][wayIdx]
+            : nullptr;
+
+    if (cachedLine && cachedLine->dirty) {
+      if (!prepareDirtyLine(*cachedLine, req.range.slpn, req.tier)) {
+        warn("icl: full-line write cannot transfer its cache reservation");
+
+        return rejectWrite();
+      }
+
+      reqInternal.reservationOwner = ReservationOwner::CacheWrite;
+    }
+
+    if (!pFTL->write(reqInternal, flash)) {
+      if (reqInternal.reservationOwner == ReservationOwner::CacheWrite) {
+        panic("icl: reserved full-line write could not be allocated");
+      }
+
+      warn("icl: full-line write rejected by target-tier admission");
+
+      return rejectWrite();
+    }
+
+    if (cachedLine &&
+        reqInternal.reservationOwner == ReservationOwner::CacheWrite) {
+      cachedLine->dirty = false;
+    }
   }
 
   if (useWriteCaching) {
-    uint32_t setIdx = calcSetIndex(reqKey);
-    uint32_t wayIdx;
-
-    wayIdx = getValidWay(reqKey, tick);
-
     // Can we update old data?
     if (wayIdx != waySize) {
       uint64_t arrived = tick;
+      Line &line = cacheData[setIdx][wayIdx];
+
+      if (dirty) {
+        if (!prepareDirtyLine(line, req.range.slpn, req.tier)) {
+          warn("icl: partial write rejected because it cannot be reserved");
+
+          return rejectWrite();
+        }
+      }
+      else {
+        cancelDirtyLine(line);
+        line.targetTier = req.tier;
+      }
 
       // Wait cache to be valid
-      if (tick < cacheData[setIdx][wayIdx].insertedAt) {
-        tick = cacheData[setIdx][wayIdx].insertedAt;
+      if (tick < line.insertedAt) {
+        tick = line.insertedAt;
       }
 
       // TODO: TEMPORAL CODE
       // We should only show DRAM latency when cache become dirty
       if (dirty) {
         // Update last accessed time
-        cacheData[setIdx][wayIdx].insertedAt = tick;
-        cacheData[setIdx][wayIdx].lastAccessed = tick;
+        line.insertedAt = tick;
+        line.lastAccessed = tick;
       }
       else {
-        cacheData[setIdx][wayIdx].insertedAt = flash;
-        cacheData[setIdx][wayIdx].lastAccessed = flash;
+        line.insertedAt = flash;
+        line.lastAccessed = flash;
       }
 
-      // Update last accessed time
-      cacheData[setIdx][wayIdx].tier = req.tier;
-      cacheData[setIdx][wayIdx].dirty = dirty;
-
       // DRAM access
-      pDRAM->write(&cacheData[setIdx][wayIdx], req.length, tick);
+      pDRAM->write(&line, req.length, tick);
 
       debugprint(LOG_ICL_GENERIC_CACHE,
                  "WRITE | Cache hit at (%u, %u) | %" PRIu64 " - %" PRIu64
@@ -643,31 +762,43 @@ bool GenericCache::write(Request &req, uint64_t &tick) {
 
       // Do we have place to write data?
       if (wayIdx != waySize) {
+        Line &line = cacheData[setIdx][wayIdx];
+
+        if (dirty) {
+          if (!prepareDirtyLine(line, req.range.slpn, req.tier)) {
+            warn("icl: partial write rejected because it cannot be reserved");
+
+            return rejectWrite();
+          }
+        }
+        else {
+          cancelDirtyLine(line);
+          line.targetTier = req.tier;
+        }
+
         // Wait cache to be valid
-        if (tick < cacheData[setIdx][wayIdx].insertedAt) {
-          tick = cacheData[setIdx][wayIdx].insertedAt;
+        if (tick < line.insertedAt) {
+          tick = line.insertedAt;
         }
 
         // TODO: TEMPORAL CODE
         // We should only show DRAM latency when cache become dirty
         if (dirty) {
           // Update last accessed time
-          cacheData[setIdx][wayIdx].insertedAt = tick;
-          cacheData[setIdx][wayIdx].lastAccessed = tick;
+          line.insertedAt = tick;
+          line.lastAccessed = tick;
         }
         else {
-          cacheData[setIdx][wayIdx].insertedAt = flash;
-          cacheData[setIdx][wayIdx].lastAccessed = flash;
+          line.insertedAt = flash;
+          line.lastAccessed = flash;
         }
 
         // Update last accessed time
-        cacheData[setIdx][wayIdx].valid = true;
-        cacheData[setIdx][wayIdx].tier = req.tier;
-        cacheData[setIdx][wayIdx].dirty = dirty;
-        cacheData[setIdx][wayIdx].tag = reqKey;
+        line.valid = true;
+        line.tag = reqKey;
 
         // DRAM access
-        pDRAM->write(&cacheData[setIdx][wayIdx], req.length, tick);
+        pDRAM->write(&line, req.length, tick);
 
         ret = true;
       }
@@ -741,16 +872,28 @@ bool GenericCache::write(Request &req, uint64_t &tick) {
           panic("Cache corrupted!");
         }
 
+        Line &line = cacheData[setIdx][wayIdx];
+
+        if (dirty) {
+          if (!prepareDirtyLine(line, req.range.slpn, req.tier)) {
+            warn("icl: partial write rejected because it cannot be reserved");
+
+            return rejectWrite();
+          }
+        }
+        else {
+          cancelDirtyLine(line);
+          line.targetTier = req.tier;
+        }
+
         // DRAM latency
-        pDRAM->write(&cacheData[setIdx][wayIdx], req.length, tick);
+        pDRAM->write(&line, req.length, tick);
 
         // Update cache data
-        cacheData[setIdx][wayIdx].insertedAt = tick;
-        cacheData[setIdx][wayIdx].lastAccessed = tick;
-        cacheData[setIdx][wayIdx].valid = true;
-        cacheData[setIdx][wayIdx].tier = req.tier;
-        cacheData[setIdx][wayIdx].dirty = true;
-        cacheData[setIdx][wayIdx].tag = reqKey;
+        line.insertedAt = tick;
+        line.lastAccessed = tick;
+        line.valid = true;
+        line.tag = reqKey;
       }
 
       debugprint(LOG_ICL_GENERIC_CACHE,
@@ -763,10 +906,21 @@ bool GenericCache::write(Request &req, uint64_t &tick) {
   }
   else {
     if (dirty) {
-      pFTL->write(reqInternal, tick);
+      if (!pFTL->write(reqInternal, tick)) {
+        warn("icl: uncached partial write rejected by target-tier admission");
+
+        return rejectWrite();
+      }
     }
     else {
       tick = flash;
+    }
+
+    if (useReadCaching && wayIdx != waySize) {
+      Line &line = cacheData[setIdx][wayIdx];
+
+      cancelDirtyLine(line);
+      line.valid = false;
     }
 
     // TEMP: Disable DRAM calculation for prevent conflict
@@ -789,10 +943,7 @@ bool GenericCache::write(Request &req, uint64_t &tick) {
 // True when flushed
 void GenericCache::flush(LPNRange &range, uint64_t &tick) {
   if (useReadCaching || useWriteCaching) {
-    uint64_t ftlTick = tick;
-    uint64_t finishedAt = tick;
-    FTL::Request reqInternal(lineCountInSuperPage);
-    reqInternal.tier = range.tier;
+    std::vector<Line *> lines;
 
     for (uint32_t setIdx = 0; setIdx < setSize; setIdx++) {
       for (uint32_t wayIdx = 0; wayIdx < waySize; wayIdx++) {
@@ -802,27 +953,38 @@ void GenericCache::flush(LPNRange &range, uint64_t &tick) {
 
         uint64_t lca = getKeyLCA(line.tag);
 
-        if (line.valid && line.tier == range.tier && lca >= range.slpn &&
-            lca < range.slpn + range.nlp) {
-          if (line.dirty) {
-            reqInternal.lpn = lca / lineCountInSuperPage;
-            reqInternal.tier = line.tier;
-            reqInternal.ioFlag.reset();
-            reqInternal.ioFlag.set(lca % lineCountInSuperPage);
-
-            ftlTick = tick;
-            pFTL->write(reqInternal, ftlTick);
-            finishedAt = MAX(finishedAt, ftlTick);
-          }
-
-          line.valid = false;
+        if (line.valid && lca >= range.slpn &&
+            lca - range.slpn < range.nlp) {
+          lines.push_back(&line);
         }
       }
     }
 
-    tick = MAX(tick, finishedAt);
+    writebackLines(lines, tick, true);
     tick += applyLatency(CPU::ICL__GENERIC_CACHE, CPU::FLUSH);
   }
+}
+
+void GenericCache::flushForMigration(const std::vector<LCA> &lcas,
+                                     uint64_t &tick) {
+  if (!useReadCaching && !useWriteCaching) {
+    return;
+  }
+
+  std::vector<Line *> lines;
+
+  for (LCA lca : lcas) {
+    uint64_t key = makeCacheKey(lca);
+    uint32_t setIdx = calcSetIndex(key);
+    uint32_t wayIdx = getValidWay(key, tick);
+
+    if (wayIdx != waySize && cacheData[setIdx][wayIdx].dirty) {
+      lines.push_back(&cacheData[setIdx][wayIdx]);
+    }
+  }
+
+  writebackLines(lines, tick, false);
+  tick += applyLatency(CPU::ICL__GENERIC_CACHE, CPU::FLUSH);
 }
 
 void GenericCache::invalidate(LPNRange &range, uint64_t &tick) {
@@ -835,10 +997,10 @@ void GenericCache::invalidate(LPNRange &range, uint64_t &tick) {
 
         uint64_t lca = getKeyLCA(line.tag);
 
-        if (line.valid && line.tier == range.tier && lca >= range.slpn &&
+        if (line.valid && lca >= range.slpn &&
             lca - range.slpn < range.nlp) {
+          cancelDirtyLine(line);
           line.valid = false;
-          line.dirty = false;
         }
       }
     }
@@ -864,10 +1026,10 @@ void GenericCache::trim(LPNRange &range, uint64_t &tick) {
 
         uint64_t lca = getKeyLCA(line.tag);
 
-        if (line.valid && line.tier == range.tier && lca >= range.slpn &&
+        if (line.valid && lca >= range.slpn &&
             lca - range.slpn < range.nlp) {
+          cancelDirtyLine(line);
           line.valid = false;
-          line.dirty = false;
         }
       }
     }
@@ -897,21 +1059,28 @@ void GenericCache::format(LPNRange &range, uint64_t &tick) {
 
     for (uint64_t i = 0; i < range.nlp; i++) {
       lpn = range.slpn + i;
-      uint64_t key = makeCacheKey(range.tier, lpn);
+      uint64_t key = makeCacheKey(lpn);
 
       setIdx = calcSetIndex(key);
       wayIdx = getValidWay(key, tick);
 
       if (wayIdx != waySize) {
         // Invalidate
+        cancelDirtyLine(cacheData[setIdx][wayIdx]);
         cacheData[setIdx][wayIdx].valid = false;
       }
     }
   }
 
-  // Convert unit
-  range.slpn /= lineCountInSuperPage;
-  range.nlp = (range.nlp - 1) / lineCountInSuperPage + 1;
+  // Convert the exact global LCA interval to the covering global LPN
+  // interval. Keep the original end when the namespace starts mid-page.
+  uint64_t endLCA = range.slpn + range.nlp;
+  uint64_t startLPN = range.slpn / lineCountInSuperPage;
+  uint64_t endLPN =
+      (endLCA + lineCountInSuperPage - 1) / lineCountInSuperPage;
+
+  range.slpn = startLPN;
+  range.nlp = endLPN - startLPN;
 
   pFTL->format(range, tick);
   tick += applyLatency(CPU::ICL__GENERIC_CACHE, CPU::FORMAT);

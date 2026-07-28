@@ -237,7 +237,22 @@ uint32_t Block::getDirtyPageCount() {
   return ret;
 }
 
-uint32_t Block::getNextWritePageIndex() {
+uint32_t Block::getDirtyPageCountRaw() const {
+  uint32_t ret = 0;
+
+  if (ioUnitInPage == 1) {
+    ret = (~(*pValidBits | *pErasedBits)).count();
+  }
+  else {
+    for (uint32_t i = 0; i < pageCount; i++) {
+      ret += (~(validBits.at(i) | erasedBits.at(i))).count();
+    }
+  }
+
+  return ret;
+}
+
+uint32_t Block::getNextWritePageIndex() const {
   uint32_t idx = 0;
 
   for (uint32_t i = 0; i < ioUnitInPage; i++) {
@@ -249,7 +264,7 @@ uint32_t Block::getNextWritePageIndex() {
   return idx;
 }
 
-uint32_t Block::getNextWritePageIndex(uint32_t idx) {
+uint32_t Block::getNextWritePageIndex(uint32_t idx) const {
   return pNextWritePageIndex[idx];
 }
 

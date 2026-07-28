@@ -44,15 +44,8 @@ ICL::ICL(ConfigReader &c) : conf(c) {
 
   FTL::Parameter *param = pFTL->getInfo();
 
-  if (conf.readBoolean(CONFIG_FTL, FTL::FTL_USE_RANDOM_IO_TWEAK)) {
-    totalLogicalPages =
-        param->totalLogicalBlocks * param->pagesInBlock * param->ioUnitInPage;
-    logicalPageSize = param->pageSize / param->ioUnitInPage;
-  }
-  else {
-    totalLogicalPages = param->totalLogicalBlocks * param->pagesInBlock;
-    logicalPageSize = param->pageSize;
-  }
+  totalLogicalPages = param->globalLogicalUnits;
+  logicalPageSize = param->pageSize / param->mappingEntriesPerPage;
 
   pCache = new GenericCache(conf, pFTL, pDRAM);
 }
@@ -159,25 +152,21 @@ void ICL::trim(LPNRange &range, uint64_t &tick) {
 
 void ICL::migrate(MigrationRequest &req, uint64_t &tick) {
   uint64_t beginAt = tick;
-  LPNRange source(req.srcLPN, req.nlp);
-  LPNRange destination(req.dstLPN, req.nlp);
-
-  source.tier = req.srcTier;
-  destination.tier = req.dstTier;
-
-  pCache->flush(source, tick);
-  pCache->invalidate(destination, tick);
   pFTL->migrate(req, tick);
 
-  if (req.success) {
-    pCache->invalidate(destination, tick);
+  if (req.status == MigrationStatus::Success &&
+      pFTL->migrationDrainRequired()) {
+    std::vector<LCA> pending = pFTL->getPendingMigrationLCAs();
+
+    pCache->flushForMigration(pending, tick);
+    pFTL->drainMigrations(req, tick);
   }
 
   debugprint(LOG_ICL,
-             "MIGRAT| SRC %u:%" PRIu64 " | DST %u:%" PRIu64
-             " | NLP %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64 ")",
-             (uint8_t)req.srcTier, req.srcLPN, (uint8_t)req.dstTier,
-             req.dstLPN, req.nlp, beginAt, tick, tick - beginAt);
+             "MIGRAT| LCA %" PRIu64 " + %" PRIu64 " | TARGET %u | STATUS %u"
+             " | %" PRIu64 " - %" PRIu64 " (%" PRIu64 ")",
+             req.startLCA, req.count, (uint8_t)req.targetTier,
+             (uint8_t)req.status, beginAt, tick, tick - beginAt);
 
   tick += applyLatency(CPU::ICL, CPU::WRITE);
 }
@@ -203,16 +192,19 @@ void ICL::getLPNInfo(uint64_t &t, uint32_t &s) {
 void ICL::getTierLPNInfo(Tier tier, uint64_t &t, uint32_t &s) {
   pFTL->getTierLPNInfo(tier, t, s);
 
-  if (conf.readBoolean(CONFIG_FTL, FTL::FTL_USE_RANDOM_IO_TWEAK)) {
-    t *= pFTL->getInfo()->ioUnitInPage;
-    s = pFTL->getInfo()->pageSize / pFTL->getInfo()->ioUnitInPage;
-  }
+  auto *param = pFTL->getInfo();
+  t *= param->mappingEntriesPerPage;
+  s = param->pageSize / param->mappingEntriesPerPage;
 }
 
 uint64_t ICL::getUsedPageCount(uint64_t lcaBegin, uint64_t lcaEnd) {
-  uint32_t ratio = pFTL->getInfo()->ioUnitInPage;
+  uint32_t ratio = pFTL->getInfo()->mappingEntriesPerPage;
 
   return pFTL->getUsedPageCount(lcaBegin / ratio, lcaEnd / ratio) * ratio;
+}
+
+bool ICL::getTierSpaceInfo(Tier tier, TierSpaceInfo &info) const {
+  return pFTL->getTierSpaceInfo(tier, info);
 }
 
 void ICL::getStatList(std::vector<Stats> &list, std::string prefix) {

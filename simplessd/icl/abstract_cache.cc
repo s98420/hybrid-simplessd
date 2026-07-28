@@ -27,17 +27,9 @@ Line::_Line()
     : tag(0),
       lastAccessed(0),
       insertedAt(0),
-      tier(Tier::TLC),
+      targetTier(Tier::TLC),
       dirty(false),
       valid(false) {}
-
-Line::_Line(uint64_t t, bool d)
-    : tag(t),
-      lastAccessed(0),
-      insertedAt(0),
-      tier(Tier::TLC),
-      dirty(d),
-      valid(true) {}
 
 AbstractCache::AbstractCache(ConfigReader &c, FTL::FTL *f,
                              DRAM::AbstractDRAM *d)

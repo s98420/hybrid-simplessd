@@ -37,9 +37,43 @@ namespace NVMe {
 
 static constexpr uint32_t SIM_NVME_TIER_SHIFT = 0;
 static constexpr uint32_t SIM_NVME_TIER_MASK = 0x00000001;
-static constexpr uint32_t SIM_NVME_MIGRATE_SRC_TIER_SHIFT = 0;
-static constexpr uint32_t SIM_NVME_MIGRATE_DST_TIER_SHIFT = 1;
-static constexpr uint32_t SIM_NVME_MIGRATE_TIER_MASK = 0x00000003;
+
+// OPCODE_SIM_MIGRATE command layout:
+// CDW10-11 = starting host LBA, CDW12 = positive exact NLB,
+// CDW13 bit 0 = target tier (0: SLC, 1: TLC), CDW14-15 = reserved/zero.
+static constexpr uint32_t SIM_NVME_MIGRATE_TARGET_TIER_SHIFT = 0;
+static constexpr uint32_t SIM_NVME_MIGRATE_TARGET_TIER_MASK = 0x00000001;
+
+// OPCODE_SIM_TIER_SPACE_QUERY command layout:
+// NSID = 0xFFFFFFFF (device-wide), CDW10 bit 0 = selected tier
+// (0: SLC, 1: TLC), CDW10 bits 31:1 and CDW11-15 = reserved/zero.
+// The 48-byte little-endian response is returned through DPTR/SGL.
+static constexpr uint32_t SIM_NVME_QUERY_TIER_SHIFT = 0;
+static constexpr uint32_t SIM_NVME_QUERY_TIER_MASK = 0x00000001;
+
+typedef struct _SimTierSpaceData {
+  uint32_t version;
+  uint8_t tier;
+  uint8_t reserved[3];
+  uint64_t writablePagesWithoutGC;
+  uint64_t writableBytesWithoutGC;
+  uint64_t pendingReservedPages;
+  uint64_t reclaimableInvalidPages;
+  uint64_t freePhysicalBlocks;
+
+  _SimTierSpaceData()
+      : version(1),
+        tier(1),
+        reserved{0, 0, 0},
+        writablePagesWithoutGC(0),
+        writableBytesWithoutGC(0),
+        pendingReservedPages(0),
+        reclaimableInvalidPages(0),
+        freePhysicalBlocks(0) {}
+} SimTierSpaceData;
+
+static_assert(sizeof(SimTierSpaceData) == 48,
+              "SIM tier-space response layout must be 48 bytes");
 
 #define MAKE_SGL_ID(type, subtype)                                             \
   (uint8_t)(((type << 4) & 0xF0) | (subtype & 0x0F))
@@ -146,6 +180,7 @@ typedef enum {
   OPCODE_SECURITY_SEND = 0x81,
   OPCODE_SECURITY_RECEIVE = 0x82,
   OPCODE_SANITIZE = 0x84,
+  OPCODE_SIM_TIER_SPACE_QUERY = 0xC1,
 
   // OpenChannel SSD 1.2
   OPCODE_DEVICE_IDENTIFICATION = 0xE2,

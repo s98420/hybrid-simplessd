@@ -26,10 +26,12 @@
 #include <fstream>
 #include <functional>
 #include <list>
+#include <memory>
 #include <ostream>
 
 #include "sim/cfg_reader.hh"
 #include "sim/engine.hh"
+#include "simplessd/util/def.hh"
 
 namespace BIL {
 
@@ -42,6 +44,7 @@ enum BIO_TYPE : uint8_t {
   BIO_FLUSH,
   BIO_TRIM,
   BIO_MIGRATE,
+  BIO_QUERY,
   BIO_NUM,
 };
 
@@ -58,13 +61,10 @@ typedef struct _BIO {
   BIO_TYPE type;
   BIO_SOURCE source;
   uint8_t tier;
-  uint8_t srcTier;
-  uint8_t dstTier;
   uint64_t offset;
   uint64_t length;
-  uint64_t srcLBA;
-  uint64_t dstLBA;
   uint64_t nlb;
+  std::shared_ptr<SimpleSSD::TierSpaceInfo> tierSpace;
 
   // I/O completion
   std::function<void(uint64_t, uint16_t)> callback;
@@ -77,12 +77,8 @@ typedef struct _BIO {
         type(BIO_READ),
         source(BIO_SOURCE_UNKNOWN),
         tier(1),
-        srcTier(1),
-        dstTier(1),
         offset(0),
         length(0),
-        srcLBA(0),
-        dstLBA(0),
         nlb(0),
         submittedAt(0) {}
 } BIO;

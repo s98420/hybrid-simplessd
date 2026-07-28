@@ -77,9 +77,8 @@ class GenericCache : public AbstractCache {
 
   uint64_t getCacheLatency();
 
-  uint64_t makeCacheKey(Tier, uint64_t);
+  uint64_t makeCacheKey(uint64_t);
   uint64_t getKeyLCA(uint64_t);
-  Tier getKeyTier(uint64_t);
   uint32_t calcSetIndex(uint64_t);
   void calcIOPosition(uint64_t, uint32_t &, uint32_t &);
 
@@ -87,6 +86,9 @@ class GenericCache : public AbstractCache {
   uint32_t getValidWay(uint64_t, uint64_t &);
   void checkSequential(Request &, SequentialDetect &);
 
+  bool prepareDirtyLine(Line &, LCA, Tier);
+  void cancelDirtyLine(Line &);
+  void writebackLines(const std::vector<Line *> &, uint64_t &, bool);
   void evictCache(uint64_t, bool = true);
 
   // Stats
@@ -103,6 +105,7 @@ class GenericCache : public AbstractCache {
   bool write(Request &, uint64_t &) override;
 
   void flush(LPNRange &, uint64_t &) override;
+  void flushForMigration(const std::vector<LCA> &, uint64_t &) override;
   void invalidate(LPNRange &, uint64_t &) override;
   void trim(LPNRange &, uint64_t &) override;
   void format(LPNRange &, uint64_t &) override;

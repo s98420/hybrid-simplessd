@@ -158,15 +158,20 @@ void HIL::migrate(MigrationRequest &req, DMAFunction &func, void *context) {
   DMAFunction doMigrate = [this](uint64_t tick, void *context) {
     auto pContext = (MigrationContext *)context;
 
-    debugprint(LOG_HIL,
-               "MIGRAT| SRC %u:%" PRIu64 " | DST %u:%" PRIu64
-               " | NLP %" PRIu64,
-               (uint8_t)pContext->req->srcTier, pContext->req->srcLPN,
-               (uint8_t)pContext->req->dstTier, pContext->req->dstLPN,
-               pContext->req->nlp);
+    debugprint(LOG_HIL, "MIGRAT| LCA %" PRIu64 " + %" PRIu64 " | TARGET %u",
+               pContext->req->startLCA, pContext->req->count,
+               (uint8_t)pContext->req->targetTier);
 
     pICL->migrate(*pContext->req, tick);
-    pContext->function(tick, pContext->context);
+
+    // Migration enqueue is synchronous at ICL/FTL, but a threshold-triggered
+    // drain can advance tick through NAND reads and writes. Route completion
+    // through the same time-ordered queue as normal I/O so the host cannot
+    // observe success before the drain has actually finished.
+    Request completion(pContext->function, pContext->context);
+    completion.finishedAt = tick;
+    completionQueue.push(completion);
+    updateCompletion();
 
     delete pContext;
   };
@@ -211,6 +216,10 @@ void HIL::getTierLPNInfo(Tier tier, uint64_t &totalLogicalPages,
 
 uint64_t HIL::getUsedPageCount(uint64_t lcaBegin, uint64_t lcaEnd) {
   return pICL->getUsedPageCount(lcaBegin, lcaEnd);
+}
+
+bool HIL::getTierSpaceInfo(Tier tier, TierSpaceInfo &info) const {
+  return pICL->getTierSpaceInfo(tier, info);
 }
 
 void HIL::updateBusyTime(int idx, uint64_t begin, uint64_t end) {

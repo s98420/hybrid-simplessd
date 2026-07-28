@@ -39,7 +39,6 @@ const char NAME_DEFAULT_TIER[] = "default_tier";
 const char NAME_ENABLE_MIGRATION[] = "EnableMigration";
 const char NAME_MIGRATION_RATIO[] = "MigrationRatio";
 const char NAME_MIGRATION_DIRECTION[] = "MigrationDirection";
-const char NAME_MIGRATION_AVOID_OVERWRITE[] = "MigrationAvoidOverwrite";
 const char NAME_TIME_BASED[] = "time_based";
 const char NAME_RUN_TIME[] = "runtime";
 
@@ -59,7 +58,6 @@ RequestConfig::RequestConfig() {
   enableMigration = false;
   migrationRatio = 0.f;
   migrationDirection = MIGRATION_BOTH;
-  migrationAvoidOverwrite = true;
   time_based = false;
   runtime = 0;
 }
@@ -151,9 +149,6 @@ bool RequestConfig::setConfig(const char *name, const char *value) {
       migrationDirection = MIGRATION_DIRECTION_NUM;
     }
   }
-  else if (MATCH_NAME(NAME_MIGRATION_AVOID_OVERWRITE)) {
-    migrationAvoidOverwrite = convertBoolean(value);
-  }
   else if (MATCH_NAME(NAME_TIME_BASED)) {
     time_based = convertBoolean(value);
   }
@@ -231,9 +226,6 @@ uint64_t RequestConfig::readUint(uint32_t idx) {
     case REQUEST_MIGRATION_DIRECTION:
       ret = migrationDirection;
       break;
-    case REQUEST_MIGRATION_AVOID_OVERWRITE:
-      ret = migrationAvoidOverwrite;
-      break;
     case REQUEST_RUN_TIME:
       ret = runtime;
       break;
@@ -266,9 +258,6 @@ bool RequestConfig::readBoolean(uint32_t idx) {
       break;
     case REQUEST_ENABLE_MIGRATION:
       ret = enableMigration;
-      break;
-    case REQUEST_MIGRATION_AVOID_OVERWRITE:
-      ret = migrationAvoidOverwrite;
       break;
   }
 

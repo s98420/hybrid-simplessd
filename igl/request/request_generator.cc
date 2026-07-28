@@ -38,7 +38,6 @@ RequestGenerator::RequestGenerator(Engine &e, BIL::BlockIOEntry &b,
       enableMigration(false),
       migrationRatio(0.f),
       migrationDirection(MIGRATION_BOTH),
-      migrationAvoidOverwrite(true),
       migration_count(0),
       migration_success_count(0),
       migration_failed_count(0),
@@ -61,8 +60,6 @@ RequestGenerator::RequestGenerator(Engine &e, BIL::BlockIOEntry &b,
   migrationRatio = c.readFloat(CONFIG_REQ_GEN, REQUEST_MIGRATION_RATIO);
   migrationDirection = (MIGRATION_DIRECTION)c.readUint(
       CONFIG_REQ_GEN, REQUEST_MIGRATION_DIRECTION);
-  migrationAvoidOverwrite =
-      c.readBoolean(CONFIG_REQ_GEN, REQUEST_MIGRATION_AVOID_OVERWRITE);
   time_based = c.readBoolean(CONFIG_REQ_GEN, REQUEST_TIME_BASED);
   runtime = c.readUint(CONFIG_REQ_GEN, REQUEST_RUN_TIME);
 
@@ -246,16 +243,6 @@ bool RequestGenerator::rangeValid(uint8_t tier, uint64_t lba, uint64_t nlb) {
   return true;
 }
 
-bool RequestGenerator::rangeInvalid(uint8_t tier, uint64_t lba, uint64_t nlb) {
-  for (uint64_t i = 0; i < nlb; i++) {
-    if (validLBA[tier].count(lba + i) > 0) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 void RequestGenerator::markRange(uint8_t tier, uint64_t lba, uint64_t nlb,
                                  bool valid) {
   for (uint64_t i = 0; i < nlb; i++) {
@@ -284,7 +271,7 @@ bool RequestGenerator::generateMigration(BIL::BIO &bio) {
     dstTier = 0;
   }
 
-  if (validLBA[srcTier].empty() || tierLBA[dstTier] < nlb) {
+  if (validLBA[srcTier].empty()) {
     migration_skipped_count++;
 
     return false;
@@ -292,31 +279,21 @@ bool RequestGenerator::generateMigration(BIL::BIO &bio) {
 
   std::uniform_int_distribution<uint64_t> srcPick(0,
                                                   validLBA[srcTier].size() - 1);
-  std::uniform_int_distribution<uint64_t> dstPick(0, tierLBA[dstTier] - nlb);
 
   for (uint32_t attempt = 0; attempt < 128; attempt++) {
     auto iter = validLBA[srcTier].begin();
     std::advance(iter, srcPick(randengine));
 
     uint64_t srcLBA = *iter;
-    uint64_t dstLBA = dstPick(randengine);
-
-    dstLBA -= dstLBA % nlb;
 
     if (srcLBA % nlb != 0 || srcLBA + nlb > tierLBA[srcTier] ||
         !rangeValid(srcTier, srcLBA, nlb)) {
       continue;
     }
-    if (migrationAvoidOverwrite && !rangeInvalid(dstTier, dstLBA, nlb)) {
-      continue;
-    }
 
     bio.type = BIL::BIO_MIGRATE;
     bio.source = BIL::BIO_SOURCE_GENERATOR;
-    bio.srcTier = srcTier;
-    bio.dstTier = dstTier;
-    bio.srcLBA = srcLBA;
-    bio.dstLBA = dstLBA;
+    bio.tier = dstTier;
     bio.nlb = nlb;
     bio.offset = srcLBA * logicalBlockSize;
     bio.length = nlb * logicalBlockSize;
@@ -380,10 +357,6 @@ void RequestGenerator::_iocallback(uint64_t id, uint16_t status) {
   if (iter != pendingMigration.end()) {
     if (status == 0) {
       migration_success_count++;
-      markRange(iter->second.srcTier, iter->second.srcLBA, iter->second.nlb,
-                false);
-      markRange(iter->second.dstTier, iter->second.dstLBA, iter->second.nlb,
-                true);
     }
     else {
       migration_failed_count++;

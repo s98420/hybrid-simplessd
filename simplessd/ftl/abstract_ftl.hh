@@ -49,11 +49,22 @@ class AbstractFTL : public StatObject {
   virtual bool initialize() = 0;
 
   virtual void read(Request &, uint64_t &) = 0;
-  virtual void write(Request &, uint64_t &) = 0;
+  virtual bool write(Request &, uint64_t &) = 0;
   virtual void trim(Request &, uint64_t &) = 0;
-  virtual bool migrate(MigrationRequest &, uint64_t &) = 0;
+  virtual void migrate(MigrationRequest &, uint64_t &) = 0;
+  virtual void drainMigrations(MigrationRequest &, uint64_t &) = 0;
+  virtual bool migrationDrainRequired() const = 0;
+  virtual std::vector<LCA> getPendingMigrationLCAs() const = 0;
+
+  virtual bool reserveCacheWrite(Tier, uint64_t) = 0;
+  virtual bool admitCacheWrite(LCA, Tier, bool, Tier) = 0;
+  virtual void releaseCacheWriteReservation(Tier, uint64_t) = 0;
+  virtual bool reserveMigration(Tier, uint64_t) = 0;
+  virtual void releaseMigrationReservation(Tier, uint64_t) = 0;
 
   virtual void format(LPNRange &, uint64_t &) = 0;
+
+  virtual bool getTierSpaceInfo(Tier, TierSpaceInfo &) const = 0;
 
   virtual Status *getStatus(uint64_t, uint64_t) = 0;
 };

@@ -80,6 +80,8 @@ class ConfigReader {
   uint32_t getPageAllocationConfig();
 
   PAL::Config::NANDTiming *getNANDTiming();
+  PAL::Config::NANDTiming *getSLCNANDTiming();
+  PAL::Config::NANDTiming *getTLCNANDTiming();
   PAL::Config::NANDPower *getNANDPower();
 };
 

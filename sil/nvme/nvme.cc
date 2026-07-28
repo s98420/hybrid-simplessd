@@ -386,11 +386,15 @@ void Driver::submitIO(BIL::BIO &bio) {
   memset(cmd, 0, 64);
 
   uint64_t slba = bio.offset / LBAsize;
-  uint32_t nlb = (uint32_t)DIVCEIL(bio.length, LBAsize);
+  uint32_t nlb = bio.length == 0
+                     ? 0
+                     : (bio.type == BIL::BIO_MIGRATE && bio.nlb > 0
+                            ? (uint32_t)bio.nlb
+                            : (uint32_t)DIVCEIL(bio.length, LBAsize));
 
   cmd[1] = namespaceID;  // NSID
 
-  if (bio.tier > 1) {
+  if (bio.tier > 1 && bio.type != BIL::BIO_QUERY) {
     SimpleSSD::panic("Invalid BIO tier");
   }
 
@@ -437,19 +441,26 @@ void Driver::submitIO(BIL::BIO &bio) {
   }
   else if (bio.type == BIL::BIO_MIGRATE) {
     cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_SIM_MIGRATE;
-    cmd[10] = (uint32_t)bio.srcLBA;
-    cmd[11] = bio.srcLBA >> 32;
-    cmd[12] = (uint32_t)bio.nlb;
-    cmd[13] = ((uint32_t)bio.srcTier
-               << SimpleSSD::HIL::NVMe::SIM_NVME_MIGRATE_SRC_TIER_SHIFT) |
-              ((uint32_t)bio.dstTier
-               << SimpleSSD::HIL::NVMe::SIM_NVME_MIGRATE_DST_TIER_SHIFT);
-    cmd[14] = (uint32_t)bio.dstLBA;
-    cmd[15] = bio.dstLBA >> 32;
+    cmd[10] = (uint32_t)slba;
+    cmd[11] = slba >> 32;
+    cmd[12] = nlb;
+    cmd[13] = ((uint32_t)bio.tier
+               << SimpleSSD::HIL::NVMe::SIM_NVME_MIGRATE_TARGET_TIER_SHIFT) &
+              SimpleSSD::HIL::NVMe::SIM_NVME_MIGRATE_TARGET_TIER_MASK;
+  }
+  else if (bio.type == BIL::BIO_QUERY) {
+    cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_SIM_TIER_SPACE_QUERY;
+    cmd[1] = NSID_ALL;
+    cmd[10] = bio.tier;
+    cmd[13] = 0;
+
+    prp = new PRP(sizeof(SimpleSSD::HIL::NVMe::SimTierSpaceData));
+    prp->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
   }
 
-  submitCommand(1, (uint8_t *)cmd, callback,
-                new IOWrapper(bio.id, prp, bio.callback));
+  submitCommand(bio.type == BIL::BIO_QUERY ? 0 : 1, (uint8_t *)cmd, callback,
+                new IOWrapper(bio.id, prp, bio.type, bio.tierSpace,
+                              bio.callback));
 }
 
 void Driver::_io(uint16_t status, void *context) {
@@ -458,6 +469,25 @@ void Driver::_io(uint16_t status, void *context) {
 
   if (status != 0) {
     SimpleSSD::warn("I/O error: %04X", status);
+  }
+  else if (wrapper->type == BIL::BIO_QUERY) {
+    if (prp == nullptr || !wrapper->tierSpace) {
+      SimpleSSD::panic("NVMe tier-space query has no response destination");
+    }
+
+    SimpleSSD::HIL::NVMe::SimTierSpaceData data;
+    prp->readData(0, sizeof(data), (uint8_t *)&data);
+
+    wrapper->tierSpace->version = data.version;
+    wrapper->tierSpace->tier = static_cast<SimpleSSD::Tier>(data.tier);
+    wrapper->tierSpace->writablePagesWithoutGC =
+        data.writablePagesWithoutGC;
+    wrapper->tierSpace->writableBytesWithoutGC =
+        data.writableBytesWithoutGC;
+    wrapper->tierSpace->pendingReservedPages = data.pendingReservedPages;
+    wrapper->tierSpace->reclaimableInvalidPages =
+        data.reclaimableInvalidPages;
+    wrapper->tierSpace->freePhysicalBlocks = data.freePhysicalBlocks;
   }
 
   wrapper->bioCallback(wrapper->id, status);

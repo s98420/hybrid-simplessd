@@ -108,6 +108,13 @@ void Driver::submitIO(BIL::BIO &bio) {
     case BIL::BIO_MIGRATE:
       SimpleSSD::panic("Migration requires NVMe interface");
       break;
+    case BIL::BIO_QUERY: {
+      bool success = bio.tierSpace && pHIL->getTierSpaceInfo(
+                                          static_cast<SimpleSSD::Tier>(bio.tier),
+                                          *bio.tierSpace);
+      bio.callback(bio.id, success ? 0 : 1);
+      delete pFunc;
+    } break;
     default:
       break;
   }

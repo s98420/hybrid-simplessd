@@ -1,0 +1,42 @@
+file(REMOVE_RECURSE
+  "../../../libmcpat.a"
+  "../../../libmcpat.pdb"
+  "CMakeFiles/mcpat.dir/XML_Parse.cc.o"
+  "CMakeFiles/mcpat.dir/array.cc.o"
+  "CMakeFiles/mcpat.dir/basic_components.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/Ucache.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/arbiter.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/area.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/bank.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/basic_circuit.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/cacti_interface.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/component.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/crossbar.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/decoder.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/htree2.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/io.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/main.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/mat.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/nuca.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/parameter.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/powergating.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/router.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/subarray.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/technology.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/uca.cc.o"
+  "CMakeFiles/mcpat.dir/cacti/wire.cc.o"
+  "CMakeFiles/mcpat.dir/core.cc.o"
+  "CMakeFiles/mcpat.dir/interconnect.cc.o"
+  "CMakeFiles/mcpat.dir/iocontrollers.cc.o"
+  "CMakeFiles/mcpat.dir/logic.cc.o"
+  "CMakeFiles/mcpat.dir/mcpat.cc.o"
+  "CMakeFiles/mcpat.dir/memoryctrl.cc.o"
+  "CMakeFiles/mcpat.dir/noc.cc.o"
+  "CMakeFiles/mcpat.dir/processor.cc.o"
+  "CMakeFiles/mcpat.dir/sharedcache.cc.o"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/mcpat.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

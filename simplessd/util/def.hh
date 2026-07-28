@@ -23,12 +23,95 @@
 #define __UTIL_DEF__
 
 #include <cinttypes>
+#include <cstddef>
 
 #include "sim/dma_interface.hh"
 #include "util/bitset.hh"
 #include "util/tier.hh"
 
 namespace SimpleSSD {
+
+using LCA = uint64_t;
+using LPN = uint64_t;
+
+inline bool isValidTier(Tier tier) {
+  return tier == Tier::SLC || tier == Tier::TLC;
+}
+
+inline size_t tierIndex(Tier tier) {
+  return static_cast<size_t>(tier);
+}
+
+inline LPN lcaToLpn(LCA lca, uint32_t mappingEntriesPerPage) {
+  return lca / mappingEntriesPerPage;
+}
+
+inline uint32_t lcaToMappingIndex(LCA lca,
+                                  uint32_t mappingEntriesPerPage) {
+  return static_cast<uint32_t>(lca % mappingEntriesPerPage);
+}
+
+inline LCA lpnToLca(LPN lpn, uint32_t mappingIndex,
+                    uint32_t mappingEntriesPerPage) {
+  return lpn * mappingEntriesPerPage + mappingIndex;
+}
+
+inline bool isValidLogicalRange(LCA startLCA, uint64_t count,
+                                uint64_t totalLogicalUnits) {
+  return startLCA <= totalLogicalUnits && count <= totalLogicalUnits - startLCA;
+}
+
+typedef struct _MappingEntry {
+  bool valid;
+  Tier tier;
+  uint32_t block;
+  uint32_t page;
+
+  _MappingEntry();
+  _MappingEntry(Tier, uint32_t, uint32_t);
+} MappingEntry;
+
+enum class MigrationStatus : uint8_t {
+  Success = 0,
+  InvalidTier,
+  OutOfRange,
+  UnmappedSource,
+  NoSpace,
+  InternalError,
+};
+
+enum class MigrationTrigger : uint8_t {
+  GarbageCollection = 0,
+  ListFull,
+};
+
+enum class ReservationOwner : uint8_t {
+  None = 0,
+  CacheWrite,
+  Migration,
+};
+
+typedef struct _MigrationRequest {
+  LCA startLCA;
+  uint64_t count;
+  Tier targetTier;
+  MigrationStatus status;
+
+  _MigrationRequest();
+  _MigrationRequest(LCA, uint64_t, Tier);
+} MigrationRequest;
+
+typedef struct _TierSpaceInfo {
+  uint32_t version;
+  Tier tier;
+  uint64_t writablePagesWithoutGC;
+  uint64_t writableBytesWithoutGC;
+  uint64_t pendingReservedPages;
+  uint64_t reclaimableInvalidPages;
+  uint64_t freePhysicalBlocks;
+
+  _TierSpaceInfo();
+} TierSpaceInfo;
 
 typedef struct _LPNRange {
   uint64_t slpn;
@@ -38,17 +121,6 @@ typedef struct _LPNRange {
   _LPNRange();
   _LPNRange(uint64_t, uint64_t);
 } LPNRange;
-
-typedef struct _MigrationRequest {
-  Tier srcTier;
-  uint64_t srcLPN;
-  Tier dstTier;
-  uint64_t dstLPN;
-  uint64_t nlp;
-  bool success;
-
-  _MigrationRequest();
-} MigrationRequest;
 
 namespace HIL {
 
@@ -96,6 +168,8 @@ typedef struct _Request {
   Tier tier;
   uint64_t lpn;
   Bitset ioFlag;
+  ReservationOwner reservationOwner;
+  bool supersedesPendingMigration;
 
   _Request(uint32_t);
   _Request(uint32_t, ICL::Request &);

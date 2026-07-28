@@ -372,6 +372,9 @@ void Subsystem::submitCommand(SQEntryWrapper &req, RequestFunction func) {
       case OPCODE_FORMAT_NVM:
         processed = formatNVM(req, func);
         break;
+      case OPCODE_SIM_TIER_SPACE_QUERY:
+        processed = queryTierSpace(req, func);
+        break;
       default:
         resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
                         STATUS_INVALID_OPCODE);
@@ -513,40 +516,10 @@ void Subsystem::migrate(Namespace *ns, MigrationRequest &req,
         : req(&r), function(f), context(c) {}
   };
 
-  Namespace::Information *info = ns->getInfo();
-  uint32_t lbaratio;
-  uint64_t srcOffset;
-  uint64_t dstOffset;
-
-  if (logicalPageSize >= info->lbaSize) {
-    lbaratio = logicalPageSize / info->lbaSize;
-
-    if (lbaratio == 0) {
-      req.success = false;
-      func(getTick(), context);
-
-      return;
-    }
-
-    // Migration command fields are host LBAs. Convert them to the same
-    // internal logical page range used by normal read/write requests before
-    // ICL cache coherence and FTL mapping lookup.
-    srcOffset = req.srcLPN % lbaratio;
-    dstOffset = req.dstLPN % lbaratio;
-    req.srcLPN = req.srcLPN / lbaratio + info->range.slpn;
-    req.dstLPN = req.dstLPN / lbaratio + info->range.slpn;
-    req.nlp = MAX((req.nlp + srcOffset + lbaratio - 1) / lbaratio,
-                  (req.nlp + dstOffset + lbaratio - 1) / lbaratio);
-  }
-  else {
-    lbaratio = info->lbaSize / logicalPageSize;
-
-    // Migration command fields are host LBAs. Internal migration requests use
-    // logical page units, matching normal read/write conversion.
-    req.srcLPN = req.srcLPN * lbaratio + info->range.slpn;
-    req.dstLPN = req.dstLPN * lbaratio + info->range.slpn;
-    req.nlp *= lbaratio;
-  }
+  Request converted;
+  convertUnit(ns, req.startLCA, req.count, req.targetTier, converted);
+  req.startLCA = converted.range.slpn;
+  req.count = converted.range.nlp;
 
   auto pContext = new MigrationContext(req, func, context);
   DMAFunction doMigrate = [this](uint64_t, void *context) {
@@ -1311,65 +1284,61 @@ bool Subsystem::formatNVM(SQEntryWrapper &req, RequestFunction &func) {
 
       info->lbaFormatIndex = lbaf;
       info->lbaSize = lbaSize[lbaf];
-      info->size = totalLogicalPages * logicalPageSize / info->lbaSize;
+      info->size = info->range.nlp * logicalPageSize / info->lbaSize;
       info->capacity = info->size;
 
-      // Reset health stat and set format progress
-      (*iter)->format(getTick());
-
-      info->utilization =
-          pHIL->getUsedPageCount(info->range.slpn,
-                                 info->range.slpn + info->range.nlp) *
-          logicalPageSize / info->lbaSize;
+      // Keep the namespace unavailable until the actual media operation's
+      // completion tick, rather than marking Format complete at submission.
+      (*iter)->beginFormat();
 
       struct FormatContext {
+        Subsystem *subsystem;
+        Namespace *ns;
+        Namespace::Information *info;
         RequestFunction function;
         CQEntryWrapper resp;
-        uint32_t remaining;
 
-        FormatContext(RequestFunction &f, CQEntryWrapper &r, uint32_t count)
-            : function(f), resp(r), remaining(count) {}
+        FormatContext(Subsystem *s, Namespace *n, Namespace::Information *i,
+                      RequestFunction &f, CQEntryWrapper &r)
+            : subsystem(s), ns(n), info(i), function(f), resp(r) {}
       };
 
-      auto pContext = new FormatContext(func, resp, 2);
-      DMAFunction doFormat = [](uint64_t, void *context) {
+      auto pContext = new FormatContext(this, *iter, info, func, resp);
+      DMAFunction doFormat = [](uint64_t tick, void *context) {
         auto pContext = (FormatContext *)context;
 
-        pContext->remaining--;
+        pContext->info->utilization =
+            pContext->subsystem->pHIL->getUsedPageCount(
+                pContext->info->range.slpn,
+                pContext->info->range.slpn + pContext->info->range.nlp) *
+            pContext->subsystem->logicalPageSize / pContext->info->lbaSize;
+        pContext->ns->finishFormat(tick);
+        pContext->function(pContext->resp);
 
-        if (pContext->remaining == 0) {
-          pContext->function(pContext->resp);
-
-          delete pContext;
-        }
+        delete pContext;
       };
 
-      // NVMe Format NVM formats the namespace. In hybrid mode the namespace
-      // spans independent SLC and TLC logical spaces, so format both explicit
-      // tier-local ranges instead of relying on the default LPNRange tier.
-      for (auto tier : {Tier::SLC, Tier::TLC}) {
-        uint64_t tierLogicalPages;
-        uint32_t tierLogicalPageSize;
-        Request *formatReq = new Request(doFormat, pContext);
+      // Format is a single global namespace operation. SES 0 performs global
+      // trim only; SES 1 additionally makes the FTL reclaim all affected SLC
+      // and TLC blocks according to their resolved physical mappings.
+      Request *formatReq = new Request(doFormat, pContext);
 
-        pHIL->getTierLPNInfo(tier, tierLogicalPages, tierLogicalPageSize);
-        formatReq->range.slpn = info->range.slpn;
-        formatReq->range.nlp = tierLogicalPages;
-        formatReq->range.tier = tier;
-        formatReq->tier = tier;
-        formatReq->offset = 0;
-        formatReq->length = tierLogicalPages * tierLogicalPageSize;
+      formatReq->range.slpn = info->range.slpn;
+      formatReq->range.nlp = info->range.nlp;
+      formatReq->range.tier = Tier::TLC;
+      formatReq->tier = Tier::TLC;
+      formatReq->offset = 0;
+      formatReq->length = info->range.nlp * logicalPageSize;
 
-        DMAFunction job = [this, ses](uint64_t, void *context) {
-          auto req = (Request *)context;
+      DMAFunction job = [this, ses](uint64_t, void *context) {
+        auto req = (Request *)context;
 
-          pHIL->format(*req, ses == 0x01);
+        pHIL->format(*req, ses == 0x01);
 
-          delete req;
-        };
+        delete req;
+      };
 
-        execute(CPU::NVME__SUBSYSTEM, CPU::FORMAT_NVM, job, formatReq);
-      }
+      execute(CPU::NVME__SUBSYSTEM, CPU::FORMAT_NVM, job, formatReq);
     }
     else {
       resp.makeStatus(false, false, TYPE_GENERIC_COMMAND_STATUS,
@@ -1379,6 +1348,88 @@ bool Subsystem::formatNVM(SQEntryWrapper &req, RequestFunction &func) {
 
   if (submit) {
     func(resp);
+  }
+
+  return true;
+}
+
+bool Subsystem::queryTierSpace(SQEntryWrapper &req, RequestFunction &func) {
+  CQEntryWrapper resp(req);
+  const bool reservedSet =
+      (req.entry.dword10 & ~SIM_NVME_QUERY_TIER_MASK) != 0 ||
+      req.entry.dword11 != 0 || req.entry.dword12 != 0 ||
+      req.entry.dword13 != 0 || req.entry.dword14 != 0 ||
+      req.entry.dword15 != 0;
+  const uint32_t tierValue =
+      (req.entry.dword10 & SIM_NVME_QUERY_TIER_MASK) >>
+      SIM_NVME_QUERY_TIER_SHIFT;
+
+  debugprint(LOG_HIL_NVME, "ADMIN   | Tier Space Query | Tier %u",
+             tierValue);
+
+  if (req.entry.namespaceID != NSID_ALL || reservedSet) {
+    resp.makeStatus(false, false, TYPE_GENERIC_COMMAND_STATUS,
+                    STATUS_INVALID_FIELD);
+    func(resp);
+
+    return true;
+  }
+
+  TierSpaceInfo info;
+  Tier tier = tierValue == 0 ? Tier::SLC : Tier::TLC;
+
+  if (!pHIL->getTierSpaceInfo(tier, info)) {
+    resp.makeStatus(false, false, TYPE_GENERIC_COMMAND_STATUS,
+                    STATUS_INVALID_FIELD);
+    func(resp);
+
+    return true;
+  }
+
+  RequestContext *pContext = new RequestContext(func, resp);
+  SimTierSpaceData data;
+
+  data.version = info.version;
+  data.tier = static_cast<uint8_t>(info.tier);
+  data.writablePagesWithoutGC = info.writablePagesWithoutGC;
+  data.writableBytesWithoutGC = info.writableBytesWithoutGC;
+  data.pendingReservedPages = info.pendingReservedPages;
+  data.reclaimableInvalidPages = info.reclaimableInvalidPages;
+  data.freePhysicalBlocks = info.freePhysicalBlocks;
+
+  pContext->buffer = (uint8_t *)malloc(sizeof(data));
+
+  if (pContext->buffer == nullptr) {
+    delete pContext;
+    panic("nvme: failed to allocate tier-space response buffer");
+  }
+
+  memcpy(pContext->buffer, &data, sizeof(data));
+
+  static DMAFunction dmaDone = [](uint64_t, void *context) {
+    RequestContext *pContext = (RequestContext *)context;
+
+    pContext->function(pContext->resp);
+
+    free(pContext->buffer);
+    delete pContext->dma;
+    delete pContext;
+  };
+  static DMAFunction transfer = [](uint64_t, void *context) {
+    RequestContext *pContext = (RequestContext *)context;
+
+    pContext->dma->write(0, sizeof(SimTierSpaceData), pContext->buffer,
+                         dmaDone, context);
+  };
+
+  if (req.useSGL) {
+    pContext->dma =
+        new SGL(cfgdata, transfer, pContext, req.entry.data1, req.entry.data2);
+  }
+  else {
+    pContext->dma = new PRPList(cfgdata, transfer, pContext, req.entry.data1,
+                                req.entry.data2,
+                                (uint64_t)sizeof(SimTierSpaceData));
   }
 
   return true;

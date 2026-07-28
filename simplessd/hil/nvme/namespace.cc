@@ -19,6 +19,8 @@
 
 #include "hil/nvme/namespace.hh"
 
+#include <limits>
+
 #include "hil/nvme/subsystem.hh"
 #include "util/algorithm.hh"
 
@@ -45,10 +47,6 @@ static Tier parseTier(uint32_t value) {
   panic("Invalid NVMe tier flag");
 
   return Tier::TLC;
-}
-
-static Tier parseMigrationTier(uint32_t value, uint32_t shift) {
-  return parseTier((value >> shift) & SIM_NVME_TIER_MASK);
 }
 
 Namespace::Namespace(Subsystem *p, ConfigData &c)
@@ -187,7 +185,11 @@ bool Namespace::isAttached() {
   return attached;
 }
 
-void Namespace::format(uint64_t tick) {
+void Namespace::beginFormat() {
+  formatFinishedAt = std::numeric_limits<uint64_t>::max();
+}
+
+void Namespace::finishFormat(uint64_t tick) {
   formatFinishedAt = tick;
 
   health = HealthInfo();
@@ -616,58 +618,78 @@ void Namespace::compare(SQEntryWrapper &req, RequestFunction &func) {
 void Namespace::migrate(SQEntryWrapper &req, RequestFunction &func) {
   bool err = false;
   CQEntryWrapper resp(req);
-  uint64_t srcLBA = ((uint64_t)req.entry.dword11 << 32) | req.entry.dword10;
-  uint64_t dstLBA = ((uint64_t)req.entry.dword15 << 32) | req.entry.dword14;
+  uint64_t slba = ((uint64_t)req.entry.dword11 << 32) | req.entry.dword10;
   uint64_t nlb = req.entry.dword12;
   uint32_t tierField = req.entry.dword13;
 
-  if (tierField & ~SIM_NVME_MIGRATE_TIER_MASK) {
+  if ((tierField & ~SIM_NVME_MIGRATE_TARGET_TIER_MASK) ||
+      req.entry.dword14 != 0 || req.entry.dword15 != 0) {
     err = true;
     resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
                     STATUS_INVALID_FIELD);
   }
 
-  Tier srcTier =
-      parseMigrationTier(tierField, SIM_NVME_MIGRATE_SRC_TIER_SHIFT);
-  Tier dstTier =
-      parseMigrationTier(tierField, SIM_NVME_MIGRATE_DST_TIER_SHIFT);
+  Tier targetTier = parseTier(
+      (tierField >> SIM_NVME_MIGRATE_TARGET_TIER_SHIFT) & SIM_NVME_TIER_MASK);
 
   if (!attached) {
     err = true;
     resp.makeStatus(true, false, TYPE_COMMAND_SPECIFIC_STATUS,
                     STATUS_NAMESPACE_NOT_ATTACHED);
   }
-  if (nlb == 0 || srcTier == dstTier) {
+  if (nlb == 0) {
     err = true;
     resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
                     STATUS_INVALID_FIELD);
   }
+  else if (slba > info.size || nlb > info.size - slba) {
+    err = true;
+    resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
+                    STATUS_LBA_OUT_OF_RANGE);
+  }
 
   debugprint(LOG_HIL_NVME,
-             "NVM     | MIGRAT| SQ %u:%u | CID %u | NSID %-5d | SRC %u:%" PRIX64
-             " | DST %u:%" PRIX64 " | NLB %" PRIu64,
+             "NVM     | MIGRAT| SQ %u:%u | CID %u | NSID %-5d | LBA %" PRIX64
+             " | NLB %" PRIu64 " | TARGET %u",
              req.sqID, req.sqUID, req.entry.dword0.commandID, nsid,
-             (uint8_t)srcTier, srcLBA, (uint8_t)dstTier, dstLBA, nlb);
+             slba, nlb, (uint8_t)targetTier);
 
   if (!err) {
     DMAFunction doMigrate = [this](uint64_t tick, void *context) {
       auto pContext = (MigrationContext *)context;
 
-      if (!pContext->req.success) {
-        pContext->resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
-                                  STATUS_INVALID_FIELD);
+      switch (pContext->req.status) {
+        case MigrationStatus::Success:
+          break;
+        case MigrationStatus::InvalidTier:
+        case MigrationStatus::UnmappedSource:
+          pContext->resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
+                                    STATUS_INVALID_FIELD);
+          break;
+        case MigrationStatus::OutOfRange:
+          pContext->resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
+                                    STATUS_LBA_OUT_OF_RANGE);
+          break;
+        case MigrationStatus::NoSpace:
+          pContext->resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
+                                    STATUS_CAPACITY_EXCEEDED);
+          break;
+        case MigrationStatus::InternalError:
+          pContext->resp.makeStatus(true, false, TYPE_GENERIC_COMMAND_STATUS,
+                                    STATUS_INTERNAL_ERROR);
+          break;
       }
 
       debugprint(LOG_HIL_NVME,
                  "NVM     | MIGRAT| CQ %u | SQ %u:%u | CID %u | NSID %-5d | "
-                 "SRC %u:%" PRIX64 " | DST %u:%" PRIX64
-                 " | NLB %" PRIu64 " | %" PRIu64 " - %" PRIu64
+                 "LCA %" PRIX64 " | COUNT %" PRIu64 " | TARGET %u"
+                 " | STATUS %u | %" PRIu64 " - %" PRIu64
                  " (%" PRIu64 ")",
                  pContext->resp.cqID, pContext->resp.entry.dword2.sqID,
                  pContext->resp.sqUID, pContext->resp.entry.dword3.commandID,
-                 nsid, (uint8_t)pContext->req.srcTier, pContext->req.srcLPN,
-                 (uint8_t)pContext->req.dstTier, pContext->req.dstLPN,
-                 pContext->req.nlp, pContext->beginAt, tick,
+                 nsid, pContext->req.startLCA, pContext->req.count,
+                 (uint8_t)pContext->req.targetTier,
+                 (uint8_t)pContext->req.status, pContext->beginAt, tick,
                  tick - pContext->beginAt);
 
       pContext->function(pContext->resp);
@@ -678,11 +700,9 @@ void Namespace::migrate(SQEntryWrapper &req, RequestFunction &func) {
     auto pContext = new MigrationContext(func, resp);
 
     pContext->beginAt = getTick();
-    pContext->req.srcTier = srcTier;
-    pContext->req.srcLPN = srcLBA;
-    pContext->req.dstTier = dstTier;
-    pContext->req.dstLPN = dstLBA;
-    pContext->req.nlp = nlb;
+    pContext->req.startLCA = slba;
+    pContext->req.count = nlb;
+    pContext->req.targetTier = targetTier;
 
     pParent->migrate(this, pContext->req, doMigrate, pContext);
   }

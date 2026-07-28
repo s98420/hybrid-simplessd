@@ -34,11 +34,6 @@ const char NAME_GROUP_BYTE_LENGTH[] = "ByteLength";
 const char NAME_GROUP_LBA_OFFSET[] = "LBAOffset";
 const char NAME_GROUP_LBA_LENGTH[] = "LBALength";
 const char NAME_GROUP_TIER[] = "Tier";
-const char NAME_GROUP_MIGRATION_SRC_TIER[] = "MigrationSrcTier";
-const char NAME_GROUP_MIGRATION_SRC_LBA[] = "MigrationSrcLBA";
-const char NAME_GROUP_MIGRATION_DST_TIER[] = "MigrationDstTier";
-const char NAME_GROUP_MIGRATION_DST_LBA[] = "MigrationDstLBA";
-const char NAME_GROUP_MIGRATION_NLB[] = "MigrationNLB";
 const char NAME_GROUP_SEC[] = "Second";
 const char NAME_GROUP_MILI_SEC[] = "Millisecond";
 const char NAME_GROUP_MICRO_SEC[] = "Microsecond";
@@ -58,11 +53,6 @@ TraceConfig::TraceConfig() {
   groupLBAOffset = 0;
   groupLBALength = 0;
   groupTier = 0;
-  groupMigrationSrcTier = 0;
-  groupMigrationSrcLBA = 0;
-  groupMigrationDstTier = 0;
-  groupMigrationDstLBA = 0;
-  groupMigrationNLB = 0;
   groupSecond = 0;
   groupMiliSecond = 0;
   groupMicroSecond = 0;
@@ -108,21 +98,6 @@ bool TraceConfig::setConfig(const char *name, const char *value) {
   }
   else if (MATCH_NAME(NAME_GROUP_TIER)) {
     groupTier = strtoul(value, nullptr, 10);
-  }
-  else if (MATCH_NAME(NAME_GROUP_MIGRATION_SRC_TIER)) {
-    groupMigrationSrcTier = strtoul(value, nullptr, 10);
-  }
-  else if (MATCH_NAME(NAME_GROUP_MIGRATION_SRC_LBA)) {
-    groupMigrationSrcLBA = strtoul(value, nullptr, 10);
-  }
-  else if (MATCH_NAME(NAME_GROUP_MIGRATION_DST_TIER)) {
-    groupMigrationDstTier = strtoul(value, nullptr, 10);
-  }
-  else if (MATCH_NAME(NAME_GROUP_MIGRATION_DST_LBA)) {
-    groupMigrationDstLBA = strtoul(value, nullptr, 10);
-  }
-  else if (MATCH_NAME(NAME_GROUP_MIGRATION_NLB)) {
-    groupMigrationNLB = strtoul(value, nullptr, 10);
   }
   else if (MATCH_NAME(NAME_GROUP_SEC)) {
     groupSecond = strtoul(value, nullptr, 10);
@@ -222,21 +197,6 @@ uint64_t TraceConfig::readUint(uint32_t idx) {
       break;
     case TRACE_GROUP_TIER:
       ret = groupTier;
-      break;
-    case TRACE_GROUP_MIGRATION_SRC_TIER:
-      ret = groupMigrationSrcTier;
-      break;
-    case TRACE_GROUP_MIGRATION_SRC_LBA:
-      ret = groupMigrationSrcLBA;
-      break;
-    case TRACE_GROUP_MIGRATION_DST_TIER:
-      ret = groupMigrationDstTier;
-      break;
-    case TRACE_GROUP_MIGRATION_DST_LBA:
-      ret = groupMigrationDstLBA;
-      break;
-    case TRACE_GROUP_MIGRATION_NLB:
-      ret = groupMigrationNLB;
       break;
     case TRACE_GROUP_SEC:
       ret = groupSecond;

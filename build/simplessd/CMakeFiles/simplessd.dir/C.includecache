@@ -1,0 +1,24 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/s98420/hybridssd/simplessd/lib/inih/ini.c
+ctype.h
+-
+stdio.h
+-
+string.h
+-
+ini.h
+/home/s98420/hybridssd/simplessd/lib/inih/ini.h
+stdlib.h
+-
+
+/home/s98420/hybridssd/simplessd/lib/inih/ini.h
+stdio.h
+-
+

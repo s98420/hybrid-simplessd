@@ -32,12 +32,13 @@ typedef struct _Line {
   uint64_t tag;
   uint64_t lastAccessed;
   uint64_t insertedAt;
-  Tier tier;
+  // One cache line represents one global LCA/sub-entry. This field is the
+  // placement selected by its latest dirty host write, not part of identity.
+  Tier targetTier;
   bool dirty;
   bool valid;
 
   _Line();
-  _Line(uint64_t, bool);
 } Line;
 
 class AbstractCache : public StatObject {
@@ -54,6 +55,7 @@ class AbstractCache : public StatObject {
   virtual bool write(Request &, uint64_t &) = 0;
 
   virtual void flush(LPNRange &, uint64_t &) = 0;
+  virtual void flushForMigration(const std::vector<LCA> &, uint64_t &) = 0;
   virtual void invalidate(LPNRange &, uint64_t &) = 0;
   virtual void trim(LPNRange &, uint64_t &) = 0;
   virtual void format(LPNRange &, uint64_t &) = 0;

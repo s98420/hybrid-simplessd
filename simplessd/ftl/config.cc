@@ -44,6 +44,7 @@ const char NAME_GC_RECLAIM_THRESHOLD[] = "GCReclaimThreshold";
 const char NAME_GC_EVICT_POLICY[] = "EvictPolicy";
 const char NAME_GC_D_CHOICE_PARAM[] = "DChoiceParam";
 const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
+const char NAME_MIGRATION_LIST_LIMIT[] = "MigrationListLimit";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -67,6 +68,7 @@ Config::Config() {
   evictPolicy = POLICY_GREEDY;
   dChoiceParam = 3;
   randomIOTweak = true;
+  migrationListLimit = 1024;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -135,6 +137,9 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_USE_RANDOM_IO_TWEAK)) {
     randomIOTweak = convertBool(value);
   }
+  else if (MATCH_NAME(NAME_MIGRATION_LIST_LIMIT)) {
+    migrationListLimit = strtoull(value, nullptr, 10);
+  }
   else {
     ret = false;
   }
@@ -143,6 +148,10 @@ bool Config::setConfig(const char *name, const char *value) {
 }
 
 void Config::update() {
+  if (migrationListLimit == 0) {
+    panic("Invalid MigrationListLimit");
+  }
+
   if (gcMode == GC_MODE_0 && reclaimBlock == 0) {
     panic("Invalid GCReclaimBlocks");
   }
@@ -219,6 +228,9 @@ uint64_t Config::readUint(uint32_t idx) {
       break;
     case FTL_GC_D_CHOICE_PARAM:
       ret = dChoiceParam;
+      break;
+    case FTL_MIGRATION_LIST_LIMIT:
+      ret = migrationListLimit;
       break;
   }
 

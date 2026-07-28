@@ -1,0 +1,9 @@
+/home/s98420/hybridssd/build/CMakeFiles/rebuild_cache.dir
+/home/s98420/hybridssd/build/CMakeFiles/edit_cache.dir
+/home/s98420/hybridssd/build/CMakeFiles/simplessd-standalone.dir
+/home/s98420/hybridssd/build/simplessd/CMakeFiles/rebuild_cache.dir
+/home/s98420/hybridssd/build/simplessd/CMakeFiles/edit_cache.dir
+/home/s98420/hybridssd/build/simplessd/CMakeFiles/simplessd.dir
+/home/s98420/hybridssd/build/simplessd/lib/mcpat/CMakeFiles/rebuild_cache.dir
+/home/s98420/hybridssd/build/simplessd/lib/mcpat/CMakeFiles/edit_cache.dir
+/home/s98420/hybridssd/build/simplessd/lib/mcpat/CMakeFiles/mcpat.dir

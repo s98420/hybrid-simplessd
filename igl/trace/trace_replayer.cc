@@ -19,6 +19,7 @@
 
 #include "igl/trace/trace_replayer.hh"
 
+#include <iostream>
 #include <sstream>
 
 #include "simplessd/sim/trace.hh"
@@ -37,6 +38,7 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
       io_count(0),
       read_count(0),
       write_count(0),
+      query_count(0),
       io_depth(0) {
   // Check file
   auto filename = c.readString(CONFIG_TRACE, TRACE_FILE);
@@ -75,16 +77,6 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
   groupID[ID_LBA_LENGTH] =
       (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_LBA_LENGTH);
   groupID[ID_TIER] = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_TIER);
-  groupID[ID_MIGRATION_SRC_TIER] =
-      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MIGRATION_SRC_TIER);
-  groupID[ID_MIGRATION_SRC_LBA] =
-      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MIGRATION_SRC_LBA);
-  groupID[ID_MIGRATION_DST_TIER] =
-      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MIGRATION_DST_TIER);
-  groupID[ID_MIGRATION_DST_LBA] =
-      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MIGRATION_DST_LBA);
-  groupID[ID_MIGRATION_NLB] =
-      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MIGRATION_NLB);
   groupID[ID_TIME_SEC] = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_SEC);
   groupID[ID_TIME_MS] =
       (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MILI_SEC);
@@ -108,12 +100,12 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
     useLBALength = true;
   }
 
-  if (useLBALength || useLBAOffset) {
-    lbaSize = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_LBA_SIZE);
+  // The fallback/simple trace grammar always uses LBA units, even when the
+  // configured regular expression uses byte fields.
+  lbaSize = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_LBA_SIZE);
 
-    if (SimpleSSD::popcount(lbaSize) != 1) {
-      SimpleSSD::panic("LBA size should be power of 2");
-    }
+  if (SimpleSSD::popcount(lbaSize) != 1) {
+    SimpleSSD::panic("LBA size should be power of 2");
   }
 
   if (!useLBAOffset && groupID[ID_BYTE_OFFSET] == 0) {
@@ -194,7 +186,8 @@ void TraceReplayer::printStats(std::ostream &out) {
       << std::to_string((double)io_submitted / tick * 1000000000000.) << " B/s)"
       << std::endl;
   out << "I/O (counts): " << io_count << " (Read: " << read_count
-      << ", Write: " << write_count << ")" << std::endl;
+      << ", Write: " << write_count << ", Query: " << query_count << ")"
+      << std::endl;
   out << "*** End of statistics ***" << std::endl;
 
   bioEntry.printStats(out);
@@ -295,6 +288,11 @@ BIL::BIO_TYPE TraceReplayer::getType(std::string type) {
     case 'm':
     case 'M':
       return BIL::BIO_MIGRATE;
+    case 'q':
+    case 'Q':
+      query_count++;
+
+      return BIL::BIO_QUERY;
   }
 
   return BIL::BIO_NUM;
@@ -317,12 +315,81 @@ uint8_t TraceReplayer::getTier(std::string tier) {
   return (uint8_t)value;
 }
 
+uint8_t TraceReplayer::getQueryTier(std::string tier) {
+  if (strcasecmp(tier.c_str(), "slc") == 0) {
+    return 0;
+  }
+  if (strcasecmp(tier.c_str(), "tlc") == 0) {
+    return 1;
+  }
+
+  char *end = nullptr;
+  uint64_t value = strtoull(tier.c_str(), &end, useHex ? 16 : 10);
+
+  if (tier.empty() || end == nullptr || *end != '\0' ||
+      value > std::numeric_limits<uint8_t>::max()) {
+    SimpleSSD::panic("Invalid query tier field");
+  }
+
+  return static_cast<uint8_t>(value);
+}
+
+bool TraceReplayer::parseSimpleQueryLine(const std::string &line) {
+  std::istringstream stream(line);
+  std::vector<std::string> fields;
+  std::string field;
+
+  while (stream >> field) {
+    fields.push_back(field);
+  }
+
+  if (fields.empty()) {
+    return false;
+  }
+
+  size_t opIndex = 0;
+
+  if (strcasecmp(fields[0].c_str(), "q") == 0) {
+    linedata.tick = 0;
+  }
+  else {
+    if (fields.size() < 2 || strcasecmp(fields[1].c_str(), "q") != 0) {
+      return false;
+    }
+
+    char *end = nullptr;
+    linedata.tick = strtoull(fields[0].c_str(), &end, 10);
+
+    if (end == nullptr || *end != '\0') {
+      return false;
+    }
+
+    opIndex = 1;
+  }
+
+  size_t tierIndex = opIndex + 1;
+
+  if (tierIndex < fields.size() && fields[tierIndex] == "|") {
+    tierIndex++;
+  }
+
+  if (tierIndex >= fields.size() || tierIndex + 1 != fields.size()) {
+    SimpleSSD::panic("Query trace format must be [time] Q [|] tier");
+  }
+
+  linedata.type = getType("Q");
+  linedata.tier = getQueryTier(fields[tierIndex]);
+  linedata.offset = 0;
+  linedata.length = 0;
+  linedata.nlb = 0;
+
+  return true;
+}
+
 bool TraceReplayer::parseSimpleLine(const std::string &line) {
   std::istringstream stream(line);
   std::string op;
   std::string tier;
-  std::string srcTier;
-  std::string dstTier;
   uint64_t time;
   uint64_t lba;
   uint64_t nlb;
@@ -335,32 +402,6 @@ bool TraceReplayer::parseSimpleLine(const std::string &line) {
   linedata.type = getType(op);
   linedata.tier = defaultTier;
 
-  if (linedata.type == BIL::BIO_MIGRATE) {
-    if (!(stream >> srcTier >> linedata.srcLBA >> dstTier >> linedata.dstLBA >>
-          linedata.nlb)) {
-      SimpleSSD::panic("Simple migration trace parse failed");
-    }
-
-    linedata.srcTier = getTier(srcTier);
-    linedata.dstTier = getTier(dstTier);
-    linedata.offset = linedata.srcLBA * lbaSize;
-    linedata.length = linedata.nlb * lbaSize;
-
-    if (linedata.nlb == 0) {
-      SimpleSSD::panic("Migration trace NLB cannot be 0");
-    }
-    if (linedata.srcLBA * lbaSize > tierSize[linedata.srcTier] ||
-        linedata.length > tierSize[linedata.srcTier] -
-                              linedata.srcLBA * lbaSize ||
-        linedata.dstLBA * lbaSize > tierSize[linedata.dstTier] ||
-        linedata.length > tierSize[linedata.dstTier] -
-                              linedata.dstLBA * lbaSize) {
-      SimpleSSD::panic("Migration trace request exceeds selected tier size");
-    }
-
-    return true;
-  }
-
   if (linedata.type == BIL::BIO_NUM) {
     return false;
   }
@@ -370,12 +411,25 @@ bool TraceReplayer::parseSimpleLine(const std::string &line) {
   }
 
   linedata.tier = getTier(tier);
+
+  if (lba > std::numeric_limits<uint64_t>::max() / lbaSize ||
+      nlb > std::numeric_limits<uint64_t>::max() / lbaSize) {
+    SimpleSSD::panic("Trace LBA range overflows byte addressing");
+  }
+
   linedata.offset = lba * lbaSize;
   linedata.length = nlb * lbaSize;
+  linedata.nlb = linedata.length == 0
+                     ? 0
+                     : DIVCEIL(linedata.length, blocksize);
 
-  if (linedata.offset > tierSize[linedata.tier] ||
-      linedata.length > tierSize[linedata.tier] - linedata.offset) {
-    SimpleSSD::panic("Trace request exceeds selected tier size");
+  uint64_t limit = linedata.type == BIL::BIO_MIGRATE
+                       ? ssdSize
+                       : tierSize[linedata.tier];
+  if ((linedata.type == BIL::BIO_MIGRATE && nlb == 0) ||
+      linedata.offset > limit ||
+      linedata.length > limit - linedata.offset) {
+    SimpleSSD::panic("Trace request exceeds selected logical range");
   }
 
   return true;
@@ -406,6 +460,9 @@ void TraceReplayer::parseLine() {
 
       return;
     }
+    if (parseSimpleQueryLine(line)) {
+      return;
+    }
     if (std::regex_match(line, match, regex)) {
       break;
     }
@@ -421,56 +478,29 @@ void TraceReplayer::parseLine() {
   linedata.type = getType(match[groupID[ID_OPERATION]].str());
   linedata.tier = defaultTier;
 
-  if (linedata.type == BIL::BIO_MIGRATE) {
-    if (groupID[ID_MIGRATION_SRC_TIER] == 0 ||
-        groupID[ID_MIGRATION_SRC_LBA] == 0 ||
-        groupID[ID_MIGRATION_DST_TIER] == 0 ||
-        groupID[ID_MIGRATION_DST_LBA] == 0 ||
-        groupID[ID_MIGRATION_NLB] == 0) {
-      SimpleSSD::panic("Migration trace groups are not configured");
-    }
-    if (match.size() <= groupID[ID_MIGRATION_SRC_TIER] ||
-        match.size() <= groupID[ID_MIGRATION_SRC_LBA] ||
-        match.size() <= groupID[ID_MIGRATION_DST_TIER] ||
-        match.size() <= groupID[ID_MIGRATION_DST_LBA] ||
-        match.size() <= groupID[ID_MIGRATION_NLB]) {
-      SimpleSSD::panic("Migration trace parse failed");
+  if (linedata.type == BIL::BIO_QUERY) {
+    if (groupID[ID_TIER] == 0 || match.size() <= groupID[ID_TIER]) {
+      SimpleSSD::panic("Query trace tier group is not configured");
     }
 
-    linedata.srcTier = getTier(match[groupID[ID_MIGRATION_SRC_TIER]].str());
-    linedata.dstTier = getTier(match[groupID[ID_MIGRATION_DST_TIER]].str());
-    linedata.srcLBA =
-        strtoul(match[groupID[ID_MIGRATION_SRC_LBA]].str().c_str(), nullptr,
-                useHex ? 16 : 10);
-    linedata.dstLBA =
-        strtoul(match[groupID[ID_MIGRATION_DST_LBA]].str().c_str(), nullptr,
-                useHex ? 16 : 10);
-    linedata.nlb =
-        strtoul(match[groupID[ID_MIGRATION_NLB]].str().c_str(), nullptr,
-                useHex ? 16 : 10);
-    linedata.offset = linedata.srcLBA * lbaSize;
-    linedata.length = linedata.nlb * lbaSize;
-
-    if (linedata.nlb == 0) {
-      SimpleSSD::panic("Migration trace NLB cannot be 0");
-    }
-    if (linedata.srcLBA * lbaSize > tierSize[linedata.srcTier] ||
-        linedata.length > tierSize[linedata.srcTier] -
-                              linedata.srcLBA * lbaSize ||
-        linedata.dstLBA * lbaSize > tierSize[linedata.dstTier] ||
-        linedata.length > tierSize[linedata.dstTier] -
-                              linedata.dstLBA * lbaSize) {
-      SimpleSSD::panic("Migration trace request exceeds selected tier size");
-    }
+    linedata.tier = getQueryTier(match[groupID[ID_TIER]].str());
+    linedata.offset = 0;
+    linedata.length = 0;
+    linedata.nlb = 0;
 
     return;
   }
 
   // Fill BIO
   if (useLBAOffset) {
-    linedata.offset = strtoul(match[groupID[ID_LBA_OFFSET]].str().c_str(),
-                              nullptr, useHex ? 16 : 10) *
-                      lbaSize;
+    uint64_t lba = strtoul(match[groupID[ID_LBA_OFFSET]].str().c_str(),
+                           nullptr, useHex ? 16 : 10);
+
+    if (lba > std::numeric_limits<uint64_t>::max() / lbaSize) {
+      SimpleSSD::panic("Trace LBA offset overflows byte addressing");
+    }
+
+    linedata.offset = lba * lbaSize;
   }
   else {
     linedata.offset = strtoul(match[groupID[ID_BYTE_OFFSET]].str().c_str(),
@@ -478,9 +508,14 @@ void TraceReplayer::parseLine() {
   }
 
   if (useLBALength) {
-    linedata.length = strtoul(match[groupID[ID_LBA_LENGTH]].str().c_str(),
-                              nullptr, useHex ? 16 : 10) *
-                      lbaSize;
+    uint64_t nlb = strtoul(match[groupID[ID_LBA_LENGTH]].str().c_str(),
+                           nullptr, useHex ? 16 : 10);
+
+    if (nlb > std::numeric_limits<uint64_t>::max() / lbaSize) {
+      SimpleSSD::panic("Trace LBA length overflows byte addressing");
+    }
+
+    linedata.length = nlb * lbaSize;
   }
   else {
     linedata.length = strtoul(match[groupID[ID_BYTE_LENGTH]].str().c_str(),
@@ -494,10 +529,20 @@ void TraceReplayer::parseLine() {
 
     linedata.tier = getTier(match[groupID[ID_TIER]].str());
   }
+  else if (linedata.type == BIL::BIO_MIGRATE) {
+    SimpleSSD::panic("Migration trace target tier group is not configured");
+  }
 
-  if (linedata.offset > tierSize[linedata.tier] ||
-      linedata.length > tierSize[linedata.tier] - linedata.offset) {
-    SimpleSSD::panic("Trace request exceeds selected tier size");
+  linedata.nlb = linedata.length == 0
+                     ? 0
+                     : DIVCEIL(linedata.length, blocksize);
+  uint64_t limit = linedata.type == BIL::BIO_MIGRATE
+                       ? ssdSize
+                       : tierSize[linedata.tier];
+  if ((linedata.type == BIL::BIO_MIGRATE && linedata.length == 0) ||
+      linedata.offset > limit ||
+      linedata.length > limit - linedata.offset) {
+    SimpleSSD::panic("Trace request exceeds selected logical range");
   }
 }
 
@@ -515,11 +560,13 @@ void TraceReplayer::submitIO() {
   bio.tier = linedata.tier;
   bio.offset = linedata.offset;
   bio.length = linedata.length;
-  bio.srcTier = linedata.srcTier;
-  bio.dstTier = linedata.dstTier;
-  bio.srcLBA = linedata.srcLBA;
-  bio.dstLBA = linedata.dstLBA;
   bio.nlb = linedata.nlb;
+
+  if (bio.type == BIL::BIO_QUERY) {
+    bio.tierSpace = std::make_shared<SimpleSSD::TierSpaceInfo>();
+    bio.tierSpace->tier = static_cast<SimpleSSD::Tier>(bio.tier);
+    queryResults.emplace(bio.id, bio.tierSpace);
+  }
 
   bioEntry.submitIO(bio);
 
@@ -549,7 +596,36 @@ void TraceReplayer::submitIO() {
   }
 }
 
-void TraceReplayer::iocallback(uint64_t, uint16_t) {
+void TraceReplayer::iocallback(uint64_t id, uint16_t status) {
+  auto query = queryResults.find(id);
+
+  if (query != queryResults.end()) {
+    if (status == 0) {
+      const auto &info = *query->second;
+      const char *tierName =
+          info.tier == SimpleSSD::Tier::SLC ? "SLC" : "TLC";
+
+      std::cout << "Q | " << tierName
+                << " | writable_pages_without_gc="
+                << info.writablePagesWithoutGC
+                << " | writable_bytes_without_gc="
+                << info.writableBytesWithoutGC
+                << " | pending_reserved_pages="
+                << info.pendingReservedPages
+                << " | reclaimable_invalid_pages="
+                << info.reclaimableInvalidPages
+                << " | free_physical_blocks=" << info.freePhysicalBlocks
+                << std::endl;
+    }
+    else {
+      std::cout << "Q | tier="
+                << static_cast<uint32_t>(query->second->tier)
+                << " | error_status=" << status << std::endl;
+    }
+
+    queryResults.erase(query);
+  }
+
   io_depth--;
 
   if (reserveTermination) {

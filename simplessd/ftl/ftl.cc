@@ -43,15 +43,26 @@ FTL::FTL(ConfigReader &c, DRAM::AbstractDRAM *d) : conf(c), pDRAM(d) {
       palparam->superBlock * slcBlocksPerPlane / blocksPerPlane;
   param.totalPhysicalBlocksByTier[1] =
       palparam->superBlock * tlcBlocksPerPlane / blocksPerPlane;
-  param.totalLogicalBlocksByTier[0] =
+  param.placementLogicalBlocksByTier[0] =
       param.totalPhysicalBlocksByTier[0] * (1 - overProvision);
-  param.totalLogicalBlocksByTier[1] =
+  param.placementLogicalBlocksByTier[1] =
       param.totalPhysicalBlocksByTier[1] * (1 - overProvision);
-  param.totalLogicalBlocks = param.totalLogicalBlocksByTier[0] +
-                             param.totalLogicalBlocksByTier[1];
   param.pagesInBlock = palparam->page;
   param.pageSize = palparam->superPageSize;
   param.ioUnitInPage = palparam->pageInSuperPage;
+  param.mappingEntriesPerPage =
+      conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK)
+          ? param.ioUnitInPage
+          : 1;
+  param.placementLogicalPagesByTier[0] =
+      param.placementLogicalBlocksByTier[0] * param.pagesInBlock;
+  param.placementLogicalPagesByTier[1] =
+      param.placementLogicalBlocksByTier[1] * param.pagesInBlock;
+  param.globalLogicalBlocks = param.placementLogicalBlocksByTier[0] +
+                              param.placementLogicalBlocksByTier[1];
+  param.globalLogicalPages = param.globalLogicalBlocks * param.pagesInBlock;
+  param.globalLogicalUnits =
+      param.globalLogicalPages * param.mappingEntriesPerPage;
   param.pageCountToMaxPerf = palparam->superBlock / palparam->block;
 
   switch (conf.readInt(CONFIG_FTL, FTL_MAPPING_MODE)) {
@@ -61,19 +72,23 @@ FTL::FTL(ConfigReader &c, DRAM::AbstractDRAM *d) : conf(c), pDRAM(d) {
   }
 
   if (param.totalPhysicalBlocks <=
-      param.totalLogicalBlocks + param.pageCountToMaxPerf) {
+      param.globalLogicalBlocks + param.pageCountToMaxPerf) {
     panic("FTL Over-Provision Ratio is too small");
   }
 
   // Print mapping Information
-  debugprint(LOG_FTL, "Total physical blocks %u", param.totalPhysicalBlocks);
-  debugprint(LOG_FTL, "Total logical blocks %u", param.totalLogicalBlocks);
+  debugprint(LOG_FTL, "Total physical blocks %" PRIu64,
+             param.totalPhysicalBlocks);
+  debugprint(LOG_FTL, "Global logical blocks/pages/units %" PRIu64 "/%" PRIu64
+                      "/%" PRIu64,
+             param.globalLogicalBlocks, param.globalLogicalPages,
+             param.globalLogicalUnits);
   debugprint(LOG_FTL, "SLC physical/logical blocks %" PRIu64 "/%" PRIu64,
              param.totalPhysicalBlocksByTier[0],
-             param.totalLogicalBlocksByTier[0]);
+             param.placementLogicalBlocksByTier[0]);
   debugprint(LOG_FTL, "TLC physical/logical blocks %" PRIu64 "/%" PRIu64,
              param.totalPhysicalBlocksByTier[1],
-             param.totalLogicalBlocksByTier[1]);
+             param.placementLogicalBlocksByTier[1]);
   debugprint(LOG_FTL, "Logical page size %u", param.pageSize);
 
   // Initialize pFTL
@@ -93,12 +108,14 @@ void FTL::read(Request &req, uint64_t &tick) {
   tick += applyLatency(CPU::FTL, CPU::READ);
 }
 
-void FTL::write(Request &req, uint64_t &tick) {
+bool FTL::write(Request &req, uint64_t &tick) {
   debugprint(LOG_FTL, "WRITE | LPN %" PRIu64, req.lpn);
 
-  pFTL->write(req, tick);
+  bool success = pFTL->write(req, tick);
 
   tick += applyLatency(CPU::FTL, CPU::WRITE);
+
+  return success;
 }
 
 void FTL::trim(Request &req, uint64_t &tick) {
@@ -111,14 +128,47 @@ void FTL::trim(Request &req, uint64_t &tick) {
 
 void FTL::migrate(MigrationRequest &req, uint64_t &tick) {
   debugprint(LOG_FTL,
-             "MIGRAT| SRC %u:%" PRIu64 " | DST %u:%" PRIu64
-             " | NLP %" PRIu64,
-             (uint8_t)req.srcTier, req.srcLPN, (uint8_t)req.dstTier,
-             req.dstLPN, req.nlp);
+             "MIGRAT| LCA %" PRIu64 " + %" PRIu64 " | TARGET %u",
+             req.startLCA, req.count, (uint8_t)req.targetTier);
 
-  req.success = pFTL->migrate(req, tick);
+  pFTL->migrate(req, tick);
 
   tick += applyLatency(CPU::FTL, CPU::WRITE);
+}
+
+void FTL::drainMigrations(MigrationRequest &req, uint64_t &tick) {
+  pFTL->drainMigrations(req, tick);
+
+  tick += applyLatency(CPU::FTL, CPU::WRITE);
+}
+
+bool FTL::migrationDrainRequired() const {
+  return pFTL->migrationDrainRequired();
+}
+
+std::vector<LCA> FTL::getPendingMigrationLCAs() const {
+  return pFTL->getPendingMigrationLCAs();
+}
+
+bool FTL::reserveCacheWrite(Tier tier, uint64_t units) {
+  return pFTL->reserveCacheWrite(tier, units);
+}
+
+bool FTL::admitCacheWrite(LCA lca, Tier tier, bool hasOldReservation,
+                          Tier oldTier) {
+  return pFTL->admitCacheWrite(lca, tier, hasOldReservation, oldTier);
+}
+
+void FTL::releaseCacheWriteReservation(Tier tier, uint64_t units) {
+  pFTL->releaseCacheWriteReservation(tier, units);
+}
+
+bool FTL::reserveMigration(Tier tier, uint64_t units) {
+  return pFTL->reserveMigration(tier, units);
+}
+
+void FTL::releaseMigrationReservation(Tier tier, uint64_t units) {
+  pFTL->releaseMigrationReservation(tier, units);
 }
 
 void FTL::format(LPNRange &range, uint64_t &tick) {
@@ -127,15 +177,21 @@ void FTL::format(LPNRange &range, uint64_t &tick) {
   tick += applyLatency(CPU::FTL, CPU::FORMAT);
 }
 
+bool FTL::getTierSpaceInfo(Tier tier, TierSpaceInfo &info) const {
+  return pFTL->getTierSpaceInfo(tier, info);
+}
+
 Parameter *FTL::getInfo() {
   return &param;
 }
 
 void FTL::getTierLPNInfo(Tier tier, uint64_t &totalLogicalPages,
                          uint32_t &logicalPageSize) {
-  uint32_t idx = tier == Tier::SLC ? 0 : 1;
+  if (!isValidTier(tier)) {
+    panic("FTL tier placement-capacity query has invalid tier");
+  }
 
-  totalLogicalPages = param.totalLogicalBlocksByTier[idx] * param.pagesInBlock;
+  totalLogicalPages = param.placementLogicalPagesByTier[tierIndex(tier)];
   logicalPageSize = param.pageSize;
 }
 

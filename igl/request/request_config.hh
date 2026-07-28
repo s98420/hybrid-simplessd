@@ -42,7 +42,6 @@ typedef enum {
   REQUEST_ENABLE_MIGRATION,
   REQUEST_MIGRATION_RATIO,
   REQUEST_MIGRATION_DIRECTION,
-  REQUEST_MIGRATION_AVOID_OVERWRITE,
   REQUEST_TIME_BASED,
   REQUEST_RUN_TIME,
 } REQUEST_CONFIG;
@@ -87,7 +86,6 @@ class RequestConfig : public SimpleSSD::BaseConfig {
   bool enableMigration;
   float migrationRatio;
   MIGRATION_DIRECTION migrationDirection;
-  bool migrationAvoidOverwrite;
   bool time_based;
   uint64_t runtime;
 

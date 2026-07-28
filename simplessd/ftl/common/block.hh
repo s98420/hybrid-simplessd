@@ -64,8 +64,9 @@ class Block {
   uint32_t getValidPageCount();
   uint32_t getValidPageCountRaw();
   uint32_t getDirtyPageCount();
-  uint32_t getNextWritePageIndex();
-  uint32_t getNextWritePageIndex(uint32_t);
+  uint32_t getDirtyPageCountRaw() const;
+  uint32_t getNextWritePageIndex() const;
+  uint32_t getNextWritePageIndex(uint32_t) const;
   bool getPageInfo(uint32_t, std::vector<uint64_t> &, Bitset &);
   bool read(uint32_t, uint32_t, uint64_t);
   bool write(uint32_t, uint64_t, uint32_t, uint64_t);
