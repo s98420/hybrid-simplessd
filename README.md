@@ -7,9 +7,13 @@
 2. I/O 指令語意
 
 R | LBA | NLB
+
 W | LBA | NLB | targetTier
+
 T | LBA | NLB
+
 M | LBA | NLB | targetTier
+
 Q | tier
 
 Read：由 global mapping 自動取得所在 tier。
