@@ -9,6 +9,10 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,6 +20,13 @@
 #include "igl/io_gen.hh"
 
 namespace IGL {
+
+struct RPCCompletion {
+  uint64_t submittedAt;
+  uint64_t completedAt;
+  uint16_t status;
+  bool completed;
+};
 
 class RPCServer : public IOGenerator {
  private:
@@ -33,15 +44,15 @@ class RPCServer : public IOGenerator {
   SimpleSSD::Event submitEvent;
   std::mutex commandMutex;
   std::condition_variable commandDone;
-  BIL::BIO pendingBio;
-  bool commandCompleted;
-  uint16_t completionStatus;
-  uint64_t submittedAt;
-  uint64_t completedAt;
+  std::deque<BIL::BIO> pendingBios;
+  std::unordered_map<uint64_t, RPCCompletion> completions;
+  uint64_t pendingCompletionCount;
 
   bool handleCommand(int, const std::string &);
   bool submitAndWait(int, BIL::BIO &);
+  bool submitBatchAndWait(int, std::vector<BIL::BIO> &, bool);
   bool sendLine(int, const std::string &);
+  bool parseBIO(std::istringstream &, const std::string &, BIL::BIO &);
   void run();
   void submitPending(uint64_t);
   void completePending(uint64_t, uint16_t);

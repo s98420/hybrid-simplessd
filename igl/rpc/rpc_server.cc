@@ -5,8 +5,11 @@
 #include "igl/rpc/rpc_server.hh"
 
 #include <cerrno>
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -28,10 +31,7 @@ RPCServer::RPCServer(Engine &e, BIL::BlockIOEntry &b, std::function<void()> &f,
       migrateCount(0),
       stopping(false),
       serverFd(-1),
-      commandCompleted(false),
-      completionStatus(0),
-      submittedAt(0),
-      completedAt(0) {
+      pendingCompletionCount(0) {
   tierSize[0] = 0;
   tierSize[1] = 0;
   submitEvent =
@@ -85,54 +85,142 @@ bool RPCServer::sendLine(int fd, const std::string &line) {
 }
 
 bool RPCServer::submitAndWait(int fd, BIL::BIO &bio) {
+  std::vector<BIL::BIO> bios;
+  bios.push_back(bio);
+  return submitBatchAndWait(fd, bios, false);
+}
+
+bool RPCServer::submitBatchAndWait(int fd, std::vector<BIL::BIO> &bios,
+                                   bool batchResponse) {
+  if (bios.empty()) {
+    return sendLine(fd, "OK BATCH 0 0 0 0 0");
+  }
+
+  uint64_t submittedAt = engine.getCurrentTick();
+
   {
     std::lock_guard<std::mutex> guard(commandMutex);
-    pendingBio = bio;
-    pendingBio.source = BIL::BIO_SOURCE_RPC;
-    commandCompleted = false;
-    submittedAt = engine.getCurrentTick();
-    completedAt = submittedAt;
+    completions.clear();
+    pendingBios.clear();
+    pendingCompletionCount = bios.size();
+
+    for (auto &bio : bios) {
+      bio.source = BIL::BIO_SOURCE_RPC;
+      pendingBios.push_back(bio);
+      completions[bio.id] = RPCCompletion{submittedAt, submittedAt, 0, false};
+    }
   }
 
   engine.scheduleEvent(submitEvent, submittedAt);
 
   std::unique_lock<std::mutex> guard(commandMutex);
-  commandDone.wait(guard,
-                   [this]() { return stopping || commandCompleted; });
+  commandDone.wait(guard, [this]() {
+    return stopping || pendingCompletionCount == 0;
+  });
 
-  if (!commandCompleted) {
+  if (pendingCompletionCount != 0) {
     return false;
   }
 
+  uint64_t firstSubmit = std::numeric_limits<uint64_t>::max();
+  uint64_t lastComplete = 0;
+  uint16_t aggregateStatus = 0;
+
+  for (const auto &item : completions) {
+    firstSubmit = std::min(firstSubmit, item.second.submittedAt);
+    lastComplete = std::max(lastComplete, item.second.completedAt);
+    if (item.second.status != 0) {
+      aggregateStatus = item.second.status;
+    }
+  }
+
   std::ostringstream response;
-  response << "OK " << bio.id << " " << completionStatus << " " << submittedAt
-           << " " << completedAt << " " << completedAt - submittedAt;
+  if (!batchResponse && bios.size() == 1) {
+    const auto &completion = completions[bios[0].id];
+    response << "OK " << bios[0].id << " " << completion.status << " "
+             << completion.submittedAt << " " << completion.completedAt << " "
+             << completion.completedAt - completion.submittedAt;
+  }
+  else {
+    response << "OK BATCH " << bios.size() << " " << aggregateStatus << " "
+             << firstSubmit << " " << lastComplete << " "
+             << lastComplete - firstSubmit;
+  }
   guard.unlock();
   return sendLine(fd, response.str());
 }
 
 void RPCServer::submitPending(uint64_t) {
-  BIL::BIO bio;
+  std::vector<BIL::BIO> bios;
 
   {
     std::lock_guard<std::mutex> guard(commandMutex);
-    bio = pendingBio;
+    while (!pendingBios.empty()) {
+      bios.push_back(pendingBios.front());
+      pendingBios.pop_front();
+    }
   }
 
-  bio.callback = [this](uint64_t id, uint16_t status) {
-    completePending(id, status);
-  };
-  bioEntry.submitIO(bio);
+  for (auto &bio : bios) {
+    bio.callback = [this](uint64_t id, uint16_t status) {
+      completePending(id, status);
+    };
+    bioEntry.submitIO(bio);
+  }
 }
 
-void RPCServer::completePending(uint64_t, uint16_t status) {
+void RPCServer::completePending(uint64_t id, uint16_t status) {
   {
     std::lock_guard<std::mutex> guard(commandMutex);
-    completionStatus = status;
-    completedAt = engine.getCurrentTick();
-    commandCompleted = true;
+    auto iter = completions.find(id);
+    if (iter == completions.end() || iter->second.completed) {
+      return;
+    }
+    iter->second.status = status;
+    iter->second.completedAt = engine.getCurrentTick();
+    iter->second.completed = true;
+    pendingCompletionCount--;
   }
-  commandDone.notify_one();
+  commandDone.notify_all();
+}
+
+bool RPCServer::parseBIO(std::istringstream &input, const std::string &operation,
+                         BIL::BIO &bio) {
+  if (operation == "READ" || operation == "WRITE") {
+    uint32_t tier = 0;
+    uint64_t lba = 0;
+    uint64_t nlb = 0;
+
+    if (!(input >> bio.id >> tier >> lba >> nlb) || tier > 1 || nlb == 0) {
+      return false;
+    }
+
+    bio.type = operation == "READ" ? BIL::BIO_READ : BIL::BIO_WRITE;
+    bio.tier = (uint8_t)tier;
+    bio.offset = lba * blockSize;
+    bio.length = nlb * blockSize;
+    bio.nlb = nlb;
+    return true;
+  }
+
+  if (operation == "MIGRATE") {
+    uint32_t srcTier = 0;
+    uint32_t dstTier = 0;
+
+    if (!(input >> bio.id >> srcTier >> bio.srcLBA >> dstTier >> bio.dstLBA >>
+          bio.nlb) ||
+        srcTier > 1 || dstTier > 1 || bio.nlb == 0) {
+      return false;
+    }
+
+    bio.type = BIL::BIO_MIGRATE;
+    bio.srcTier = (uint8_t)srcTier;
+    bio.dstTier = (uint8_t)dstTier;
+    bio.length = bio.nlb * blockSize;
+    return true;
+  }
+
+  return false;
 }
 
 bool RPCServer::handleCommand(int fd, const std::string &line) {
@@ -155,44 +243,46 @@ bool RPCServer::handleCommand(int fd, const std::string &line) {
     return false;
   }
 
-  BIL::BIO bio;
-
-  if (operation == "READ" || operation == "WRITE") {
-    uint32_t tier = 0;
-    uint64_t lba = 0;
-    uint64_t nlb = 0;
-
-    if (!(input >> bio.id >> tier >> lba >> nlb) || tier > 1 || nlb == 0) {
-      return sendLine(fd, "ERR usage_READ_WRITE_id_tier_lba_nlb");
+  if (operation == "BATCH") {
+    size_t count = 0;
+    if (!(input >> count) || count == 0) {
+      return sendLine(fd, "ERR usage_BATCH_count_commands");
     }
-
-    bio.type = operation == "READ" ? BIL::BIO_READ : BIL::BIO_WRITE;
-    bio.tier = (uint8_t)tier;
-    bio.offset = lba * blockSize;
-    bio.length = nlb * blockSize;
-    bio.nlb = nlb;
-    commandCount++;
-    operation == "READ" ? readCount++ : writeCount++;
-    return submitAndWait(fd, bio);
+    std::vector<BIL::BIO> bios;
+    bios.reserve(count);
+    for (size_t index = 0; index < count; index++) {
+      std::string batchOperation;
+      BIL::BIO bio;
+      if (!(input >> batchOperation) || !parseBIO(input, batchOperation, bio)) {
+        return sendLine(fd, "ERR usage_BATCH_count_commands");
+      }
+      commandCount++;
+      if (batchOperation == "READ") {
+        readCount++;
+      }
+      else if (batchOperation == "WRITE") {
+        writeCount++;
+      }
+      else {
+        migrateCount++;
+      }
+      bios.push_back(bio);
+    }
+    return submitBatchAndWait(fd, bios, true);
   }
 
-  if (operation == "MIGRATE") {
-    uint32_t srcTier = 0;
-    uint32_t dstTier = 0;
-
-    if (!(input >> bio.id >> srcTier >> bio.srcLBA >> dstTier >> bio.dstLBA >>
-          bio.nlb) ||
-        srcTier > 1 || dstTier > 1 || bio.nlb == 0) {
-      return sendLine(
-          fd, "ERR usage_MIGRATE_id_src_tier_src_lba_dst_tier_dst_lba_nlb");
-    }
-
-    bio.type = BIL::BIO_MIGRATE;
-    bio.srcTier = (uint8_t)srcTier;
-    bio.dstTier = (uint8_t)dstTier;
-    bio.length = bio.nlb * blockSize;
+  BIL::BIO bio;
+  if (parseBIO(input, operation, bio)) {
     commandCount++;
-    migrateCount++;
+    if (operation == "READ") {
+      readCount++;
+    }
+    else if (operation == "WRITE") {
+      writeCount++;
+    }
+    else {
+      migrateCount++;
+    }
     return submitAndWait(fd, bio);
   }
 
