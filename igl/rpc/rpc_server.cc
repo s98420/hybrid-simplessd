@@ -203,6 +203,21 @@ bool RPCServer::parseBIO(std::istringstream &input, const std::string &operation
     return true;
   }
 
+  if (operation == "FLUSH") {
+    uint32_t tier = 0;
+
+    if (!(input >> bio.id >> tier) || tier > 1) {
+      return false;
+    }
+
+    bio.type = BIL::BIO_FLUSH;
+    bio.tier = (uint8_t)tier;
+    bio.offset = 0;
+    bio.length = blockSize;
+    bio.nlb = 1;
+    return true;
+  }
+
   if (operation == "MIGRATE") {
     uint32_t srcTier = 0;
     uint32_t dstTier = 0;
@@ -280,7 +295,7 @@ bool RPCServer::handleCommand(int fd, const std::string &line) {
     else if (operation == "WRITE") {
       writeCount++;
     }
-    else {
+    else if (operation == "MIGRATE") {
       migrateCount++;
     }
     return submitAndWait(fd, bio);
