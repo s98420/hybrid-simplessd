@@ -18,6 +18,7 @@
  */
 
 #include "ftl/ftl.hh"
+#include "ftl/subpage_mapping.hh"
 
 #include "ftl/page_mapping.hh"
 
@@ -36,7 +37,10 @@ FTL::FTL(ConfigReader &c, DRAM::AbstractDRAM *d) : conf(c), pDRAM(d) {
       conf.readUint(CONFIG_PAL, PAL::NAND_SLC_BLOCK);
   uint64_t tlcBlocksPerPlane =
       conf.readUint(CONFIG_PAL, PAL::NAND_TLC_BLOCK);
-  float overProvision = conf.readFloat(CONFIG_FTL, FTL_OVERPROVISION_RATIO);
+  float slcOverProvision =
+      conf.readFloat(CONFIG_FTL, FTL_SLC_OVERPROVISION_RATIO);
+  float tlcOverProvision =
+      conf.readFloat(CONFIG_FTL, FTL_TLC_OVERPROVISION_RATIO);
 
   param.totalPhysicalBlocks = palparam->superBlock;
   param.totalPhysicalBlocksByTier[0] =
@@ -44,19 +48,32 @@ FTL::FTL(ConfigReader &c, DRAM::AbstractDRAM *d) : conf(c), pDRAM(d) {
   param.totalPhysicalBlocksByTier[1] =
       palparam->superBlock * tlcBlocksPerPlane / blocksPerPlane;
   param.totalLogicalBlocksByTier[0] =
-      param.totalPhysicalBlocksByTier[0] * (1 - overProvision);
+      param.totalPhysicalBlocksByTier[0] * (1 - slcOverProvision);
   param.totalLogicalBlocksByTier[1] =
-      param.totalPhysicalBlocksByTier[1] * (1 - overProvision);
+      param.totalPhysicalBlocksByTier[1] * (1 - tlcOverProvision);
   param.totalLogicalBlocks = param.totalLogicalBlocksByTier[0] +
                              param.totalLogicalBlocksByTier[1];
   param.pagesInBlock = palparam->page;
   param.pageSize = palparam->superPageSize;
   param.ioUnitInPage = palparam->pageInSuperPage;
   param.pageCountToMaxPerf = palparam->superBlock / palparam->block;
+  physicalParam = param;
+  const uint64_t mappingUnit = conf.readUint(CONFIG_FTL, FTL_MAPPING_UNIT);
+  if (mappingUnit) {
+    if (palparam->pageSize != 16384 || palparam->plane != 1) {
+      panic("4 KiB mapping currently requires 16 KiB NAND pages and one plane");
+    }
+    param.ioUnitInPage = param.pageSize / mappingUnit;
+  }
 
   switch (conf.readInt(CONFIG_FTL, FTL_MAPPING_MODE)) {
     case PAGE_MAPPING:
-      pFTL = new PageMapping(conf, param, pPAL, pDRAM);
+      if (mappingUnit) {
+        pFTL = new SubpageMapping(conf, param, physicalParam, pPAL, pDRAM);
+      }
+      else {
+        pFTL = new PageMapping(conf, param, pPAL, pDRAM);
+      }
       break;
   }
 
@@ -65,9 +82,23 @@ FTL::FTL(ConfigReader &c, DRAM::AbstractDRAM *d) : conf(c), pDRAM(d) {
     panic("FTL Over-Provision Ratio is too small");
   }
 
+  for (uint32_t idx = 0; idx < 2; idx++) {
+    const uint64_t spareBlocks = param.totalPhysicalBlocksByTier[idx] -
+                                 param.totalLogicalBlocksByTier[idx];
+    if (spareBlocks <= param.pageCountToMaxPerf) {
+      warn("FTL: %s over-provisioning leaves only %" PRIu64
+           " spare blocks for %u parallel allocation slots; high occupancy may "
+           "cause GC pressure",
+           idx == 0 ? "SLC" : "TLC", spareBlocks,
+           param.pageCountToMaxPerf);
+    }
+  }
+
   // Print mapping Information
   debugprint(LOG_FTL, "Total physical blocks %u", param.totalPhysicalBlocks);
   debugprint(LOG_FTL, "Total logical blocks %u", param.totalLogicalBlocks);
+  debugprint(LOG_FTL, "SLC/TLC over-provisioning %.4f/%.4f",
+             slcOverProvision, tlcOverProvision);
   debugprint(LOG_FTL, "SLC physical/logical blocks %" PRIu64 "/%" PRIu64,
              param.totalPhysicalBlocksByTier[0],
              param.totalLogicalBlocksByTier[0]);
@@ -119,6 +150,10 @@ void FTL::migrate(MigrationRequest &req, uint64_t &tick) {
   req.success = pFTL->migrate(req, tick);
 
   tick += applyLatency(CPU::FTL, CPU::WRITE);
+}
+
+void FTL::flush(Tier tier, uint64_t &tick) {
+  pFTL->flush(tier, tick);
 }
 
 void FTL::format(LPNRange &range, uint64_t &tick) {

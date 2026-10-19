@@ -43,6 +43,8 @@ class Subsystem : public AbstractSubsystem {
 
   // Stats
   uint64_t commandCount;
+  uint64_t writeRequestBytes[2];
+  uint64_t migrationRequestBytes[2];
 
   void convertUnit(Namespace *, uint64_t, uint64_t, Tier, Request &);
   bool createNamespace(uint32_t, Namespace::Information *);

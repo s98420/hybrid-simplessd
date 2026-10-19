@@ -52,6 +52,7 @@ class AbstractFTL : public StatObject {
   virtual void write(Request &, uint64_t &) = 0;
   virtual void trim(Request &, uint64_t &) = 0;
   virtual bool migrate(MigrationRequest &, uint64_t &) = 0;
+  virtual void flush(Tier, uint64_t &) {}
 
   virtual void format(LPNRange &, uint64_t &) = 0;
 

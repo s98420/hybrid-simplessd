@@ -155,6 +155,12 @@ void RPCServer::submitPending(uint64_t) {
 
   {
     std::lock_guard<std::mutex> guard(commandMutex);
+    if (statsPending) {
+      statsResponse = bioEntry.flashWriteStats();
+      statsPending = false;
+      commandDone.notify_all();
+      return;
+    }
     while (!pendingBios.empty()) {
       bios.push_back(pendingBios.front());
       pendingBios.pop_front();
@@ -243,6 +249,19 @@ bool RPCServer::handleCommand(int fd, const std::string &line) {
   std::string operation;
 
   input >> operation;
+
+  if (operation == "FLASH_STATS") {
+    std::unique_lock<std::mutex> guard(commandMutex);
+    statsPending = true;
+    guard.unlock();
+    engine.scheduleEvent(submitEvent, engine.getCurrentTick());
+    guard.lock();
+    commandDone.wait(guard, [this]() { return stopping || !statsPending; });
+    if (stopping) return false;
+    const std::string response = statsResponse;
+    guard.unlock();
+    return sendLine(fd, response);
+  }
 
   if (operation == "INFO") {
     std::ostringstream response;

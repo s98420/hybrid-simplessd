@@ -455,6 +455,9 @@ void PALOLD::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "Total program operation bytes";
   list.push_back(temp);
 
+  list.push_back({prefix + "slc.program.bytes", "SLC NAND program bytes including migration and GC"});
+  list.push_back({prefix + "tlc.program.bytes", "TLC NAND program bytes including migration and GC"});
+
   temp.name = prefix + "erase.bytes";
   temp.desc = "Total erase operation bytes";
   list.push_back(temp);
@@ -572,6 +575,8 @@ void PALOLD::getStatValues(std::vector<double> &values) {
 
   values.push_back(stat.readCount * param.pageSize);
   values.push_back(stat.writeCount * param.pageSize);
+  values.push_back(stat.slcWriteCount * param.pageSize);
+  values.push_back(stat.tlcWriteCount * param.pageSize);
   values.push_back(stat.eraseCount * param.pageSize * param.page);
 
   stats->getReadBreakdown(breakdown);

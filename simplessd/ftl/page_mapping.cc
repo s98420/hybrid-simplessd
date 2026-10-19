@@ -117,6 +117,12 @@ bool PageMapping::initialize() {
     uint64_t nTotalLogicalPages = region.totalLogicalPages;
     uint64_t nPagesToWarmup = nTotalLogicalPages * fillRatio;
     uint64_t nPagesToInvalidate = nTotalLogicalPages * invalidRatio;
+    const bool nonoverlappingTierFill =
+        conf.readBoolean(CONFIG_FTL, FTL_NONOVERLAPPING_TIER_FILL);
+    const uint64_t warmupBegin =
+        nonoverlappingTierFill && region.tier == Tier::SLC
+            ? nTotalLogicalPages - nPagesToWarmup
+            : 0;
     uint64_t maxPagesBeforeGC =
         param.pagesInBlock *
         (region.totalPhysicalBlocks *
@@ -141,6 +147,9 @@ bool PageMapping::initialize() {
                "%s logical pages to fill: %" PRIu64 " (%.2f %%)", tierName,
                nPagesToWarmup, nPagesToWarmup * 100.f / nTotalLogicalPages);
     debugprint(LOG_FTL_PAGE_MAPPING,
+               "%s sequential warm-up range: [%" PRIu64 ", %" PRIu64 ")",
+               tierName, warmupBegin, warmupBegin + nPagesToWarmup);
+    debugprint(LOG_FTL_PAGE_MAPPING,
                "%s invalidated pages to create: %" PRIu64 " (%.2f %%)",
                tierName, nPagesToInvalidate,
                nPagesToInvalidate * 100.f / nTotalLogicalPages);
@@ -153,7 +162,7 @@ bool PageMapping::initialize() {
       // Sequential
       for (uint64_t i = 0; i < nPagesToWarmup; i++) {
         tick = 0;
-        req.lpn = i;
+        req.lpn = warmupBegin + i;
         writeInternal(req, region, tick, false);
       }
     }
@@ -175,7 +184,7 @@ bool PageMapping::initialize() {
       // Sequential
       for (uint64_t i = 0; i < nPagesToInvalidate; i++) {
         tick = 0;
-        req.lpn = i;
+        req.lpn = warmupBegin + i;
         writeInternal(req, region, tick, false);
       }
     }
@@ -865,6 +874,9 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
             writeRequests.push_back(req);
 
             region.stat.validPageCopies++;
+            if (gcCopyObserver) {
+              gcCopyObserver(region.tier, lpns.at(idx) * bitsetSize + idx);
+            }
           }
         }
 

@@ -23,6 +23,7 @@
 #include <array>
 #include <cinttypes>
 #include <list>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -43,6 +44,7 @@ class PageMapping : public AbstractFTL {
 
   bool bRandomTweak;
   uint32_t bitsetSize;
+  std::function<void(Tier, uint64_t)> gcCopyObserver;
 
   typedef struct _RegionStat {
     uint64_t gcCount;
@@ -110,6 +112,13 @@ class PageMapping : public AbstractFTL {
   void write(Request &, uint64_t &) override;
   void trim(Request &, uint64_t &) override;
   bool migrate(MigrationRequest &, uint64_t &) override;
+  // Query a physical-page mapping without changing NAND state or statistics.
+  bool hasMapping(Tier tier, uint64_t lca) {
+    return isValidMapping(getRegion(tier), lca / bitsetSize, lca % bitsetSize);
+  }
+  void setGCCopyObserver(std::function<void(Tier, uint64_t)> observer) {
+    gcCopyObserver = observer;
+  }
 
   void format(LPNRange &, uint64_t &) override;
 

@@ -49,7 +49,10 @@ Subsystem::Subsystem(Controller *ctrl, ConfigData &cfg)
     : AbstractSubsystem(ctrl, cfg),
       pHIL(nullptr),
       allocatedLogicalPages(0),
-      commandCount(0) {}
+      commandCount(0) {
+  writeRequestBytes[0] = writeRequestBytes[1] = 0;
+  migrationRequestBytes[0] = migrationRequestBytes[1] = 0;
+}
 
 Subsystem::~Subsystem() {
   for (auto &iter : lNamespaces) {
@@ -454,6 +457,8 @@ void Subsystem::read(Namespace *ns, uint64_t slba, uint64_t nlblk, Tier tier,
 
 void Subsystem::write(Namespace *ns, uint64_t slba, uint64_t nlblk, Tier tier,
                       DMAFunction &func, void *context) {
+  Namespace::Information *info = ns->getInfo();
+  writeRequestBytes[tier == Tier::SLC ? 0 : 1] += nlblk * info->lbaSize;
   Request *req = new Request(func, context);
   DMAFunction doWrite = [this](uint64_t, void *context) {
     auto req = (Request *)context;
@@ -508,15 +513,27 @@ void Subsystem::migrate(Namespace *ns, MigrationRequest &req,
     MigrationRequest *req;
     DMAFunction function;
     void *context;
+    uint64_t requestedBytes;
 
-    MigrationContext(MigrationRequest &r, DMAFunction &f, void *c)
-        : req(&r), function(f), context(c) {}
+    MigrationContext(MigrationRequest &r, DMAFunction &f, void *c, uint64_t b)
+        : req(&r), function(f), context(c), requestedBytes(b) {}
   };
 
   Namespace::Information *info = ns->getInfo();
+  const uint64_t requestedBytes = req.nlp * info->lbaSize;
   uint32_t lbaratio;
   uint64_t srcOffset;
   uint64_t dstOffset;
+
+  if (conf.readUint(CONFIG_FTL, FTL::FTL_MAPPING_UNIT) &&
+      logicalPageSize >= info->lbaSize) {
+    const uint32_t alignment = logicalPageSize / info->lbaSize;
+    if (req.srcLPN % alignment || req.dstLPN % alignment || req.nlp % alignment) {
+      req.success = false;
+      func(getTick(), context);
+      return;
+    }
+  }
 
   if (logicalPageSize >= info->lbaSize) {
     lbaratio = logicalPageSize / info->lbaSize;
@@ -548,13 +565,20 @@ void Subsystem::migrate(Namespace *ns, MigrationRequest &req,
     req.nlp *= lbaratio;
   }
 
-  auto pContext = new MigrationContext(req, func, context);
+  auto pContext = new MigrationContext(req, func, context, requestedBytes);
   DMAFunction doMigrate = [this](uint64_t, void *context) {
     auto pContext = (MigrationContext *)context;
+    DMAFunction migrationDone = [this](uint64_t tick, void *context) {
+      auto pContext = (MigrationContext *)context;
+      if (pContext->req->success) {
+        uint32_t rid = pContext->req->dstTier == Tier::SLC ? 0 : 1;
+        migrationRequestBytes[rid] += pContext->requestedBytes;
+      }
+      pContext->function(tick, pContext->context);
+      delete pContext;
+    };
 
-    pHIL->migrate(*pContext->req, pContext->function, pContext->context);
-
-    delete pContext;
+    pHIL->migrate(*pContext->req, migrationDone, pContext);
   };
 
   execute(CPU::NVME__SUBSYSTEM, CPU::CONVERT_UNIT, doMigrate, pContext);
@@ -1391,17 +1415,32 @@ void Subsystem::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "Total number of NVMe command handled";
   list.push_back(temp);
 
+  list.push_back({prefix + "hil.slc.write.request.bytes",
+                  "Bytes requested by upper-layer normal WRITE commands to SLC"});
+  list.push_back({prefix + "hil.tlc.write.request.bytes",
+                  "Bytes requested by upper-layer normal WRITE commands to TLC"});
+  list.push_back({prefix + "hil.slc.migration.request.bytes",
+                  "Successful logical migration destination bytes requested to SLC"});
+  list.push_back({prefix + "hil.tlc.migration.request.bytes",
+                  "Successful logical migration destination bytes requested to TLC"});
+
   pHIL->getStatList(list, prefix);
 }
 
 void Subsystem::getStatValues(std::vector<double> &values) {
   values.push_back(commandCount);
+  values.push_back(writeRequestBytes[0]);
+  values.push_back(writeRequestBytes[1]);
+  values.push_back(migrationRequestBytes[0]);
+  values.push_back(migrationRequestBytes[1]);
 
   pHIL->getStatValues(values);
 }
 
 void Subsystem::resetStatValues() {
   commandCount = 0;
+  writeRequestBytes[0] = writeRequestBytes[1] = 0;
+  migrationRequestBytes[0] = migrationRequestBytes[1] = 0;
 
   pHIL->resetStatValues();
 }

@@ -131,6 +131,8 @@ class BlockIOEntry {
 
   void printStats(std::ostream &);
   void getProgress(Progress &);
+  // Called on the simulation thread, never directly from the RPC worker.
+  std::string flashWriteStats();
 };
 
 }  // namespace BIL

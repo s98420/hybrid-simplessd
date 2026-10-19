@@ -44,6 +44,7 @@ typedef struct {
 class FTL : public StatObject {
  private:
   Parameter param;
+  Parameter physicalParam;
   PAL::PAL *pPAL;
 
   ConfigReader &conf;
@@ -58,6 +59,7 @@ class FTL : public StatObject {
   void write(Request &, uint64_t &);
   void trim(Request &, uint64_t &);
   void migrate(MigrationRequest &, uint64_t &);
+  void flush(Tier, uint64_t &);
 
   void format(LPNRange &, uint64_t &);
 

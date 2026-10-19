@@ -30,6 +30,8 @@ typedef enum {
   /* Common FTL configuration */
   FTL_MAPPING_MODE,
   FTL_OVERPROVISION_RATIO,
+  FTL_SLC_OVERPROVISION_RATIO,
+  FTL_TLC_OVERPROVISION_RATIO,
   FTL_GC_THRESHOLD_RATIO,
   FTL_BAD_BLOCK_THRESHOLD,
   FTL_FILLING_MODE,
@@ -45,6 +47,9 @@ typedef enum {
   FTL_GC_EVICT_POLICY,
   FTL_GC_D_CHOICE_PARAM,
   FTL_USE_RANDOM_IO_TWEAK,
+  FTL_MAPPING_UNIT,
+  FTL_MIGRATION_COALESCING,
+  FTL_NONOVERLAPPING_TIER_FILL,
 
   /* N+K Mapping configuration*/
   FTL_NKMAP_N,
@@ -77,6 +82,10 @@ class Config : public BaseConfig {
  private:
   MAPPING mapping;             //!< Default: PAGE_MAPPING
   float overProvision;         //!< Default: 0.25 (25%)
+  float slcOverProvision;      //!< Default: overProvision
+  float tlcOverProvision;      //!< Default: overProvision
+  bool slcOverProvisionSet;
+  bool tlcOverProvisionSet;
   float gcThreshold;           //!< Default: 0.05 (5%)
   uint64_t badBlockThreshold;  //!< Default: 100000
   FILLING_MODE fillingMode;    //!< Default: FILLING_MODE_0
@@ -96,6 +105,9 @@ class Config : public BaseConfig {
   EVICT_POLICY evictPolicy;    //!< Default: POLICY_GREEDY
   uint64_t dChoiceParam;       //!< Default: 3
   bool randomIOTweak;          //!< Default: true
+  uint64_t mappingUnit;        //!< 0: existing physical-page mapping
+  bool migrationCoalescing;
+  bool nonoverlappingTierFill;
 
  public:
   Config();

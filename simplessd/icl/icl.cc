@@ -98,6 +98,13 @@ void ICL::read(Request &req, uint64_t &tick) {
 }
 
 void ICL::write(Request &req, uint64_t &tick) {
+  if (conf.readUint(CONFIG_FTL, FTL::FTL_MAPPING_UNIT)) {
+    // A normal targeted write transfers ownership of its logical subpages.
+    // Preserve dirty bytes and evict stale copies from the other tier first.
+    LPNRange other(req.range.slpn, req.range.nlp);
+    other.tier = req.tier == Tier::SLC ? Tier::TLC : Tier::SLC;
+    pCache->flush(other, tick);
+  }
   uint64_t beginAt;
   uint64_t finishedAt = tick;
   uint64_t reqRemain = req.length;
@@ -135,6 +142,7 @@ void ICL::flush(LPNRange &range, uint64_t &tick) {
   uint64_t beginAt = tick;
 
   pCache->flush(range, tick);
+  pFTL->flush(range.tier, tick);
 
   debugprint(LOG_ICL,
              "FLUSH | LCA %" PRIu64 " + %" PRIu64 " | %" PRIu64 " - %" PRIu64
@@ -166,10 +174,13 @@ void ICL::migrate(MigrationRequest &req, uint64_t &tick) {
   destination.tier = req.dstTier;
 
   pCache->flush(source, tick);
-  pCache->invalidate(destination, tick);
+  // Materialize dirty destination data before conflict validation. Discarding
+  // a dirty line here could hide an already-valid destination and lose writes.
+  pCache->flush(destination, tick);
   pFTL->migrate(req, tick);
 
   if (req.success) {
+    pCache->invalidate(source, tick);
     pCache->invalidate(destination, tick);
   }
 

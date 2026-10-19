@@ -47,6 +47,8 @@ class RPCServer : public IOGenerator {
   std::deque<BIL::BIO> pendingBios;
   std::unordered_map<uint64_t, RPCCompletion> completions;
   uint64_t pendingCompletionCount;
+  bool statsPending = false;
+  std::string statsResponse;
 
   bool handleCommand(int, const std::string &);
   bool submitAndWait(int, BIL::BIO &);

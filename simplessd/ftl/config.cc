@@ -29,6 +29,8 @@ namespace FTL {
 
 const char NAME_MAPPING_MODE[] = "MappingMode";
 const char NAME_OVERPROVISION_RATIO[] = "OverProvisioningRatio";
+const char NAME_SLC_OVERPROVISION_RATIO[] = "SLCOverProvisioningRatio";
+const char NAME_TLC_OVERPROVISION_RATIO[] = "TLCOverProvisioningRatio";
 const char NAME_GC_THRESHOLD[] = "GCThreshold";
 const char NAME_BAD_BLOCK_THRESHOLD[] = "EraseThreshold";
 const char NAME_FILLING_MODE[] = "FillingMode";
@@ -44,10 +46,15 @@ const char NAME_GC_RECLAIM_THRESHOLD[] = "GCReclaimThreshold";
 const char NAME_GC_EVICT_POLICY[] = "EvictPolicy";
 const char NAME_GC_D_CHOICE_PARAM[] = "DChoiceParam";
 const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
+const char NAME_NONOVERLAPPING_TIER_FILL[] = "EnableNonOverlappingTierFill";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
   overProvision = 0.25f;
+  slcOverProvision = 0.25f;
+  tlcOverProvision = 0.25f;
+  slcOverProvisionSet = false;
+  tlcOverProvisionSet = false;
   gcThreshold = 0.05f;
   badBlockThreshold = 100000;
   fillingMode = FILLING_MODE_0;
@@ -67,16 +74,40 @@ Config::Config() {
   evictPolicy = POLICY_GREEDY;
   dChoiceParam = 3;
   randomIOTweak = true;
+  mappingUnit = 0;
+  migrationCoalescing = false;
+  nonoverlappingTierFill = false;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
   bool ret = true;
 
-  if (MATCH_NAME(NAME_MAPPING_MODE)) {
+  if (MATCH_NAME("FTLMappingUnit")) {
+    mappingUnit = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME("EnableMigrationCoalescing")) {
+    migrationCoalescing = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_NONOVERLAPPING_TIER_FILL)) {
+    nonoverlappingTierFill = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_MAPPING_MODE)) {
     mapping = (MAPPING)strtoul(value, nullptr, 10);
   }
   else if (MATCH_NAME(NAME_OVERPROVISION_RATIO)) {
     overProvision = strtof(value, nullptr);
+  }
+  else if (MATCH_NAME(NAME_SLC_OVERPROVISION_RATIO)) {
+    if (strlen(value) > 0) {
+      slcOverProvision = strtof(value, nullptr);
+      slcOverProvisionSet = true;
+    }
+  }
+  else if (MATCH_NAME(NAME_TLC_OVERPROVISION_RATIO)) {
+    if (strlen(value) > 0) {
+      tlcOverProvision = strtof(value, nullptr);
+      tlcOverProvisionSet = true;
+    }
   }
   else if (MATCH_NAME(NAME_GC_THRESHOLD)) {
     gcThreshold = strtof(value, nullptr);
@@ -143,6 +174,31 @@ bool Config::setConfig(const char *name, const char *value) {
 }
 
 void Config::update() {
+  if (overProvision < 0.f || overProvision >= 1.f) {
+    panic("Invalid OverProvisioningRatio");
+  }
+  if (!slcOverProvisionSet) {
+    slcOverProvision = overProvision;
+  }
+  if (!tlcOverProvisionSet) {
+    tlcOverProvision = overProvision;
+  }
+  if (slcOverProvision < 0.f || slcOverProvision >= 1.f) {
+    panic("Invalid SLCOverProvisioningRatio");
+  }
+  if (tlcOverProvision < 0.f || tlcOverProvision >= 1.f) {
+    panic("Invalid TLCOverProvisioningRatio");
+  }
+
+  if (mappingUnit != 0 && mappingUnit != 4096) {
+    panic("FTLMappingUnit must be 0 (legacy) or 4096");
+  }
+  if (mappingUnit && !randomIOTweak) {
+    panic("FTLMappingUnit requires EnableRandomIOTweak");
+  }
+  if (nonoverlappingTierFill && fillingMode == FILLING_MODE_2) {
+    panic("EnableNonOverlappingTierFill requires sequential filling");
+  }
   if (gcMode == GC_MODE_0 && reclaimBlock == 0) {
     panic("Invalid GCReclaimBlocks");
   }
@@ -208,6 +264,9 @@ uint64_t Config::readUint(uint32_t idx) {
   uint64_t ret = 0;
 
   switch (idx) {
+    case FTL_MAPPING_UNIT:
+      ret = mappingUnit;
+      break;
     case FTL_FILLING_MODE:
       ret = fillingMode;
       break;
@@ -231,6 +290,12 @@ float Config::readFloat(uint32_t idx) {
   switch (idx) {
     case FTL_OVERPROVISION_RATIO:
       ret = overProvision;
+      break;
+    case FTL_SLC_OVERPROVISION_RATIO:
+      ret = slcOverProvision;
+      break;
+    case FTL_TLC_OVERPROVISION_RATIO:
+      ret = tlcOverProvision;
       break;
     case FTL_GC_THRESHOLD_RATIO:
       ret = gcThreshold;
@@ -265,6 +330,12 @@ bool Config::readBoolean(uint32_t idx) {
   bool ret = false;
 
   switch (idx) {
+    case FTL_MIGRATION_COALESCING:
+      ret = migrationCoalescing;
+      break;
+    case FTL_NONOVERLAPPING_TIER_FILL:
+      ret = nonoverlappingTierFill;
+      break;
     case FTL_USE_RANDOM_IO_TWEAK:
       ret = randomIOTweak;
       break;

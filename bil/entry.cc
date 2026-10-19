@@ -197,6 +197,31 @@ void BlockIOEntry::writeRequestLatency(BIO &bio, uint64_t completeTick,
                        << latencyTick << "," << status << std::endl;
 }
 
+std::string BlockIOEntry::flashWriteStats() {
+  std::vector<SimpleSSD::Stats> names;
+  std::vector<double> values;
+  pDriver->initStats(names);
+  pDriver->getStats(values);
+  uint64_t bytes[6] = {0, 0, 0, 0, 0, 0};
+  bool found[6] = {false, false, false, false, false, false};
+  const char *wanted[6] = {
+      "pal.slc.program.bytes", "pal.tlc.program.bytes",
+      "hil.slc.write.request.bytes", "hil.tlc.write.request.bytes",
+      "hil.slc.migration.request.bytes", "hil.tlc.migration.request.bytes"};
+  for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
+    for (size_t index = 0; index < 6; ++index) {
+      if (names[i].name == wanted[index]) {
+        bytes[index] = static_cast<uint64_t>(values[i]);
+        found[index] = true;
+      }
+    }
+  }
+  for (bool value : found) if (!value) return "ERR flash_stats_unavailable";
+  std::string response = "OK FLASH_STATS";
+  for (uint64_t value : bytes) response += " " + std::to_string(value);
+  return response;
+}
+
 void BlockIOEntry::printStats(std::ostream &out) {
   double avgLatency = (double)sumLatency / io_count;
   double stdevLatency = sqrt((double)squareSumLatency / io_count - avgLatency);
