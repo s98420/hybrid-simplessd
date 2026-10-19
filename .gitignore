@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# Local CMake output trees. Source and checked-in configuration files live
+# outside these directories.
+build/
+build-4k/
+build-rpc/
